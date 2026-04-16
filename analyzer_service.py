@@ -72,7 +72,8 @@ def analyze_stocks(
     stock_codes: List[str],
     config: Config = None,
     full_report: bool = False,
-    notifier: Optional[NotificationService] = None
+    notifier: Optional[NotificationService] = None,
+    merge_notification: bool = True
 ) -> List[AnalysisResult]:
     """
     分析多只股票
@@ -82,6 +83,7 @@ def analyze_stocks(
         config: 配置对象（可选，默认使用单例）
         full_report: 是否生成完整报告
         notifier: 通知服务（可选）
+        merge_notification: 是否合并通知为一封邮件（默认 True）
         
     Returns:
         分析结果列表
@@ -89,11 +91,29 @@ def analyze_stocks(
     if config is None:
         config = get_config()
     
+    report_type = ReportType.FULL if full_report else ReportType.SIMPLE
     results = []
+    
+    # 批量分析时不逐只发送通知,最后统一合并发送
     for stock_code in stock_codes:
-        result = analyze_stock(stock_code, config, full_report, notifier)
+        result = analyze_stock(
+            stock_code, config, full_report,
+            notifier=None if merge_notification else notifier
+        )
         if result:
             results.append(result)
+    
+    # 合并通知: 所有股票分析完成后,生成汇总报告一次性发送
+    if merge_notification and notifier and results:
+        try:
+            aggregate_report = notifier.generate_aggregate_report(
+                results, report_type
+            )
+            if notifier.is_available():
+                notifier.send(aggregate_report, email_send_to_all=True)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"合并发送通知失败: {e}")
     
     return results
 
