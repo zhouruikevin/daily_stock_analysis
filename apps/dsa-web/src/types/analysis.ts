@@ -234,6 +234,28 @@ export interface HistoryPagination {
   limit: number;
 }
 
+// ============ History Trend Types ============
+
+/** History trend single-day item */
+export interface HistoryTrendItem {
+  date: string;
+  stockName?: string;
+  operationAdvice?: string;
+  trendPrediction?: string;
+  sentimentScore?: number;
+  changePct?: number;
+  volumeRatio?: number;
+  turnoverRate?: number;
+  indexCsi2000Pct?: number;
+  indexChinextPct?: number;
+}
+
+/** History trend response */
+export interface HistoryTrendResponse {
+  stockCode: string;
+  items: HistoryTrendItem[];
+}
+
 // ============ Error Types ============
 
 export interface ApiError {

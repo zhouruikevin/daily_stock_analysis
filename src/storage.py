@@ -244,6 +244,13 @@ class AnalysisHistory(Base):
     stop_loss = Column(Float)
     take_profit = Column(Float)
 
+    # 行情快照字段（从 context_snapshot / raw_result 提取，便于趋势查询）
+    change_pct = Column(Float)          # 当日涨跌幅(%)
+    volume_ratio = Column(Float)        # 量比
+    turnover_rate = Column(Float)       # 换手率(%)
+    index_csi2000_pct = Column(Float)   # 中证2000涨跌幅(%)
+    index_chinext_pct = Column(Float)   # 创业板涨跌幅(%)
+
     created_at = Column(DateTime, default=datetime.now, index=True)
 
     __table_args__ = (
@@ -269,6 +276,11 @@ class AnalysisHistory(Base):
             'secondary_buy': self.secondary_buy,
             'stop_loss': self.stop_loss,
             'take_profit': self.take_profit,
+            'change_pct': self.change_pct,
+            'volume_ratio': self.volume_ratio,
+            'turnover_rate': self.turnover_rate,
+            'index_csi2000_pct': self.index_csi2000_pct,
+            'index_chinext_pct': self.index_chinext_pct,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -692,6 +704,9 @@ class DatabaseManager:
         # 创建所有表
         Base.metadata.create_all(self._engine)
 
+        # 自动迁移：为已有表补充新增列（SQLite 不支持 ALTER TABLE ADD COLUMN IF NOT EXISTS）
+        self._auto_migrate_add_columns()
+
         self._initialized = True
         logger.info(f"数据库初始化完成: {db_url}")
 
@@ -747,6 +762,48 @@ class DatabaseManager:
                 logger.warning("初始化 SQLite PRAGMA 失败: %s", exc)
             finally:
                 cursor.close()
+
+    def _auto_migrate_add_columns(self) -> None:
+        """为已有表自动补充新增列。
+
+        SQLAlchemy 的 create_all 不会给已有表添加新列。
+        本方法检测缺失列并执行 ALTER TABLE ADD COLUMN，确保旧库升级后不会缺列。
+        每个新增列仅当表中尚不存在时才添加，幂等安全。
+        """
+        if not self._is_sqlite_engine:
+            return
+
+        # 定义需要自动补充的列: (table_name, column_name, column_sql_type)
+        _NEW_COLUMNS = [
+            ("analysis_history", "change_pct", "FLOAT"),
+            ("analysis_history", "volume_ratio", "FLOAT"),
+            ("analysis_history", "turnover_rate", "FLOAT"),
+            ("analysis_history", "index_csi2000_pct", "FLOAT"),
+            ("analysis_history", "index_chinext_pct", "FLOAT"),
+        ]
+
+        with self._engine.connect() as conn:
+            for table_name, column_name, column_type in _NEW_COLUMNS:
+                try:
+                    # PRAGMA table_info 返回已有列信息
+                    result = conn.execute(
+                        __import__("sqlalchemy").text(
+                            f"PRAGMA table_info({table_name})"
+                        )
+                    )
+                    existing_columns = {row[1] for row in result}
+                    if column_name not in existing_columns:
+                        conn.execute(
+                            __import__("sqlalchemy").text(
+                                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                            )
+                        )
+                        conn.commit()
+                        logger.info(f"自动迁移: 已添加列 {table_name}.{column_name}")
+                except Exception as exc:
+                    logger.warning(
+                        f"自动迁移: 添加列 {table_name}.{column_name} 失败: {exc}"
+                    )
 
     def _is_file_sqlite_database(self) -> bool:
         database = (self._engine.url.database or "").strip()
@@ -1188,6 +1245,7 @@ class DatabaseManager:
 
         sniper_points = self._extract_sniper_points(result)
         raw_result = self._build_raw_result(result)
+        market_metrics = self._extract_market_metrics(result, context_snapshot)
         context_text = None
         if save_snapshot and context_snapshot is not None:
             context_text = self._safe_json_dumps(context_snapshot)
@@ -1211,6 +1269,9 @@ class DatabaseManager:
                         secondary_buy=sniper_points.get("secondary_buy"),
                         stop_loss=sniper_points.get("stop_loss"),
                         take_profit=sniper_points.get("take_profit"),
+                        change_pct=market_metrics.get("change_pct"),
+                        volume_ratio=market_metrics.get("volume_ratio"),
+                        turnover_rate=market_metrics.get("turnover_rate"),
                         created_at=datetime.now(),
                     )
                 )
@@ -1221,6 +1282,62 @@ class DatabaseManager:
             )
         except Exception as e:
             logger.error(f"保存分析历史失败: {e}")
+            return 0
+
+    def update_index_data_for_today(
+        self,
+        code: str,
+        csi2000_pct: Optional[float] = None,
+        chinext_pct: Optional[float] = None,
+    ) -> int:
+        """回写当天该股票历史记录的指数涨跌幅。
+
+        如果已有值则跳过（不覆盖），仅在 NULL 时回填。
+        对同一天同一股票的所有记录统一更新。
+
+        Returns:
+            更新的行数
+        """
+        if csi2000_pct is None and chinext_pct is None:
+            return 0
+
+        try:
+            def _write(session: Session) -> int:
+                from sqlalchemy import text as sa_text
+
+                conditions = []
+                params: Dict[str, Any] = {"code": code}
+
+                # 仅更新当天且字段为 NULL 的记录
+                conditions.append("code = :code")
+                conditions.append("DATE(created_at) = DATE('now', 'localtime')")
+
+                set_clauses = []
+                if csi2000_pct is not None:
+                    set_clauses.append("index_csi2000_pct = :csi2000")
+                    params["csi2000"] = csi2000_pct
+                    conditions.append("index_csi2000_pct IS NULL")
+                if chinext_pct is not None:
+                    set_clauses.append("index_chinext_pct = :chinext")
+                    params["chinext"] = chinext_pct
+                    conditions.append("index_chinext_pct IS NULL")
+
+                if not set_clauses:
+                    return 0
+
+                sql = sa_text(
+                    f"UPDATE analysis_history SET {', '.join(set_clauses)} "
+                    f"WHERE {' AND '.join(conditions)}"
+                )
+                result = session.execute(sql, params)
+                return result.rowcount
+
+            return self._run_write_transaction(
+                "update_index_data_for_today",
+                _write,
+            )
+        except Exception as e:
+            logger.warning(f"回写指数数据失败 {code}: {e}")
             return 0
 
     def get_analysis_history(
@@ -1318,7 +1435,61 @@ class DatabaseManager:
             results = session.execute(data_query).scalars().all()
             
             return list(results), total
-    
+
+    def get_daily_latest_history(
+        self,
+        code: str,
+        days: int = 30,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> List[AnalysisHistory]:
+        """按天取最后一条分析记录，用于历史趋势展示。
+
+        对同一股票同一天内的多条记录，只保留 created_at 最新的一条。
+        返回结果按日期降序排列。
+
+        Args:
+            code: 股票代码
+            days: 查询最近多少天（默认30天，当 start_date 未指定时使用）
+            start_date: 开始日期（含，可选）
+            end_date: 结束日期（含，可选）
+
+        Returns:
+            按日期降序排列的分析记录列表，每天至多一条
+        """
+        cutoff = datetime.combine(
+            start_date or (date.today() - timedelta(days=days)),
+            datetime.min.time(),
+        )
+        end_dt = datetime.combine(
+            (end_date + timedelta(days=1)) if end_date else datetime.max.time().replace(hour=23, minute=59, second=59),
+            datetime.min.time(),
+        ) if end_date else datetime.max
+
+        with self.get_session() as session:
+            # 子查询：每天取 created_at 最大的记录 ID
+            daily_max = (
+                select(
+                    func.DATE(AnalysisHistory.created_at).label('d'),
+                    func.max(AnalysisHistory.id).label('max_id'),
+                )
+                .where(
+                    AnalysisHistory.code == code,
+                    AnalysisHistory.created_at >= cutoff,
+                )
+                .group_by(func.DATE(AnalysisHistory.created_at))
+                .subquery()
+            )
+
+            # 主查询：获取这些记录的完整数据
+            results = session.execute(
+                select(AnalysisHistory)
+                .join(daily_max, AnalysisHistory.id == daily_max.c.max_id)
+                .order_by(desc(AnalysisHistory.created_at))
+            ).scalars().all()
+
+            return list(results)
+
     def get_analysis_history_by_id(self, record_id: int) -> Optional[AnalysisHistory]:
         """
         根据数据库主键 ID 查询单条分析历史记录
@@ -1818,6 +1989,84 @@ class DatabaseManager:
             "stop_loss": self._parse_sniper_value(raw_points.get("stop_loss")),
             "take_profit": self._parse_sniper_value(raw_points.get("take_profit")),
         }
+
+    @staticmethod
+    def _safe_parse_percent(value: Any) -> Optional[float]:
+        """Parse a percentage value from various formats to float.
+
+        Handles: numeric types, plain number strings, percent strings like '-1.87%',
+        and filters out 'N/A', None, empty strings.
+        """
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        if not text or text in ('N/A', 'None', '-', '—', '--'):
+            return None
+        if text.endswith('%'):
+            text = text[:-1].strip()
+        try:
+            return float(text)
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _extract_market_metrics(
+        result: Any,
+        context_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Optional[float]]:
+        """从 AnalysisResult 和 context_snapshot 提取行情指标。
+
+        按优先级依次从 context_snapshot -> raw_result -> dashboard 提取
+        change_pct、volume_ratio、turnover_rate 三个字段。
+
+        Returns:
+            {change_pct, volume_ratio, turnover_rate}
+        """
+        parse = DatabaseManager._safe_parse_percent
+        metrics = {"change_pct": None, "volume_ratio": None, "turnover_rate": None}
+
+        # Priority 1: context_snapshot.enhanced_context.realtime
+        if isinstance(context_snapshot, dict):
+            ec = context_snapshot.get("enhanced_context") or {}
+            rt = ec.get("realtime") or {}
+            if rt:
+                metrics["change_pct"] = parse(rt.get("change_pct"))
+                metrics["volume_ratio"] = parse(rt.get("volume_ratio"))
+                metrics["turnover_rate"] = parse(rt.get("turnover_rate"))
+
+            # Priority 2: context_snapshot.realtime_quote_raw
+            rqr = context_snapshot.get("realtime_quote_raw") or {}
+            if rqr and metrics["change_pct"] is None:
+                metrics["change_pct"] = parse(rqr.get("change_pct")) or parse(rqr.get("pct_chg"))
+            if rqr and metrics["volume_ratio"] is None:
+                metrics["volume_ratio"] = parse(rqr.get("volume_ratio"))
+            if rqr and metrics["turnover_rate"] is None:
+                metrics["turnover_rate"] = parse(rqr.get("turnover_rate"))
+
+        # Priority 3: raw_result.market_snapshot
+        raw_result = result.to_dict() if hasattr(result, "to_dict") else {}
+        ms = raw_result.get("market_snapshot") or {}
+        if ms:
+            if metrics["change_pct"] is None:
+                metrics["change_pct"] = parse(ms.get("pct_chg")) or parse(ms.get("change_pct"))
+            if metrics["volume_ratio"] is None:
+                metrics["volume_ratio"] = parse(ms.get("volume_ratio"))
+            if metrics["turnover_rate"] is None:
+                metrics["turnover_rate"] = parse(ms.get("turnover_rate"))
+
+        # Priority 4: raw_result.dashboard.data_perspective
+        dashboard = raw_result.get("dashboard") or {}
+        dp = dashboard.get("data_perspective") or {}
+        va = dp.get("volume_analysis") or {}
+        if va:
+            if metrics["volume_ratio"] is None:
+                metrics["volume_ratio"] = parse(va.get("volume_ratio"))
+            if metrics["turnover_rate"] is None:
+                metrics["turnover_rate"] = parse(va.get("turnover_rate"))
+
+        return metrics
 
     @staticmethod
     def _find_sniper_in_dashboard(d: dict) -> Optional[Dict[str, Any]]:

@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [测试] 补充设置项帮助元数据、API schema、前端弹窗交互测试，并修复 Bot 名称路由与调度时间 provider 测试的离线 CI 稳定性问题。
 
 ## [3.15.0] - 2026-05-05
+- [修复] 大盘复盘链路接入 `REPORT_LANGUAGE`：`REPORT_LANGUAGE=en` 时，A 股/合并复盘的 Prompt、章节标题、模板兜底文案与通知包装标题统一改为英文，避免出现英文正文外包中文标题的问题。
+- [修复] `AGENT_MAX_STEPS` 在 orchestrator 多 Agent 模式下统一明确为“默认作为各子 Agent 的步数上限而非硬覆盖；TechnicalAgent 等高默认值 Agent 会被封顶、低默认值 Agent 保持原值；当用户主动调高（>10）时，再统一覆盖所有子 Agent 采用全局值”，同时修复用户设置 12 但 TechnicalAgent 仍以默认 6 步运行并报 "Agent exceeded max steps" 的问题（fixes #1026）
+- [修复] Specialist（Skill）Agent 失败不再中断整个分析管线，改为与 intel/risk 相同的优雅降级策略
+- [改进] Agent 超步数错误信息增加 AGENT_MAX_STEPS 调整提示，帮助用户自助排查
+- [修复] **MiniMax-M2.7 模型连接测试支持** — 修复 LLM 通道连接测试在 MiniMax-M2.7 模型下返回 "Empty response" 的问题；增加了 `max_tokens` 上限（8→256）以容纳 MiniMax 思考过程，并添加 `content_blocks` 格式解析逻辑统一处理 MiniMax 响应格式差异。
+- [新功能] 历史分析趋势展示：AnalysisHistory 新增 change_pct/volume_ratio/turnover_rate/index_csi2000_pct/index_chinext_pct 五个行情快照列；新增 /api/v1/history/trend 按天取最后一条的 API；前端报告详情底部展示历史趋势表格；邮件/通知报告追加历史趋势模块；中证2000指数数据源补充；新增回补脚本 scripts/backfill_history_metrics.py
+- [改进] 后端股票名称解析改为优先复用前端 `stocks.index.json` 全量索引并懒加载缓存；纯后端/缺失静态资源场景静默降级回 `STOCK_NAME_MAP` 与原有数据源回退链路。
+- [改进] Agent IntelAgent 新增公司公告搜索维度（上交所/深交所/cninfo）与主力资金流工具（get_capital_flow），修复 Agent 模式下公告和资金流数据经常缺失的问题
+- [修复] webui_frontend.py 在 static/index.html 存在但 static/assets/ 缺失时发出明确警告，避免用户因 CSS/JS 资源缺失导致页面元素异常变大却无从排查
+- [修复] `StockAnalysisPipeline` 搜索服务与社交舆情服务改为可选降级初始化：任一服务初始化异常时记录 warning 并以禁用状态继续运行，避免外部依赖抖动阻塞主分析链路与 SSE 进度回调。
+- [文档] DEPLOY.md 和 deploy-webui-cloud.md 新增"UI 元素异常变大/布局错乱"排查步骤（重建 Docker 镜像或手动执行 npm run build）
+- [文档] 补充飞书 Webhook 配置说明：强调 `FEISHU_WEBHOOK_URL` 是群通知必填项、`FEISHU_WEBHOOK_SECRET` 与飞书机器人「签名校验」必须两端同时启用或同时关闭、`FEISHU_APP_SECRET` 仅用于应用/Stream Bot 模式不可替代 Webhook；同步完善英文指南并在 `.env.example` 为相关配置项补充内联说明注释
 
 ### 发布亮点
 
