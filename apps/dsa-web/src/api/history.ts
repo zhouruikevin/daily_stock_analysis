@@ -7,6 +7,7 @@ import type {
   AnalysisReport,
   NewsIntelResponse,
   NewsIntelItem,
+  HistoryTrendResponse,
 } from '../types/analysis';
 
 // ============ API 接口 ============
@@ -76,6 +77,18 @@ export const historyApi = {
   getMarkdown: async (recordId: number): Promise<string> => {
     const response = await apiClient.get<{ content: string }>(`/api/v1/history/${recordId}/markdown`);
     return response.data.content;
+  },
+
+  /**
+   * 获取股票历史趋势数据（按天取最后一条）
+   * @param stockCode 股票代码
+   * @param days 查询天数（默认30）
+   */
+  getTrend: async (stockCode: string, days = 30): Promise<HistoryTrendResponse> => {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/history/trend', {
+      params: { stock_code: stockCode, days },
+    });
+    return toCamelCase<HistoryTrendResponse>(response.data);
   },
 
   /**

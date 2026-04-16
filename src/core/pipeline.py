@@ -512,6 +512,12 @@ class StockAnalysisPipeline:
                 except Exception as e:
                     logger.warning(f"{stock_name}({code}) 保存分析历史失败: {e}")
 
+                # 回写当天指数涨跌幅（中证2000、创业板指）
+                try:
+                    self._backfill_index_data_for_stock(code)
+                except Exception as e:
+                    logger.debug(f"{stock_name}({code}) 回写指数数据失败（不影响主流程）: {e}")
+
             return result
 
         except Exception as e:
@@ -859,6 +865,12 @@ class StockAnalysisPipeline:
                 except Exception as e:
                     logger.warning(f"[{code}] 保存 Agent 分析历史失败: {e}")
 
+                # 回写当天指数涨跌幅（中证2000、创业板指）
+                try:
+                    self._backfill_index_data_for_stock(code)
+                except Exception as e:
+                    logger.debug(f"[{code}] Agent模式回写指数数据失败: {e}")
+
             return result
 
         except Exception as e:
@@ -1080,6 +1092,48 @@ class StockAnalysisPipeline:
             new_df = pd.DataFrame([new_row])
             df = pd.concat([df, new_df], ignore_index=True)
         return df
+
+    def _backfill_index_data_for_stock(self, code: str) -> None:
+        """获取当天指数涨跌幅并回写到该股票的历史记录中。
+
+        仅对 A 股代码执行，非 A 股跳过。
+        获取失败不影响主流程。
+        """
+        from data_provider.base import normalize_stock_code as _norm
+
+        normalized = _norm(code)
+        # 仅 A 股需要指数数据（6位纯数字）
+        if not (len(normalized) == 6 and normalized.isdigit()):
+            return
+
+        try:
+            indices = self.fetcher_manager.get_main_indices(region="cn")
+            if not indices:
+                return
+
+            csi2000_pct = None
+            chinext_pct = None
+            for idx in indices:
+                idx_code = str(idx.get("code", ""))
+                name = idx.get("name", "")
+                pct = idx.get("change_pct")
+                # 中证2000: 399303
+                if idx_code == "399303" or "中证2000" in name:
+                    csi2000_pct = pct
+                # 创业板指: 399006
+                elif idx_code == "399006" or "创业板" in name:
+                    chinext_pct = pct
+
+            if csi2000_pct is not None or chinext_pct is not None:
+                rows = self.db.update_index_data_for_today(
+                    code=code,
+                    csi2000_pct=csi2000_pct,
+                    chinext_pct=chinext_pct,
+                )
+                if rows:
+                    logger.debug(f"[{code}] 已回写指数数据: 中证2000={csi2000_pct}, 创业板={chinext_pct}")
+        except Exception:
+            pass  # 不影响主流程
 
     def _build_context_snapshot(
         self,

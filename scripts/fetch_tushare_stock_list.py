@@ -48,6 +48,7 @@ except ImportError:
 load_dotenv()
 
 TUSHARE_TOKEN = os.getenv('TUSHARE_TOKEN')
+TUSHARE_API_URL = os.getenv('TUSHARE_API_URL') or None  # 自定义 API 地址
 OUTPUT_DIR = Path(__file__).parent.parent / "data"
 PAGE_SIZE = 5000  # 美股每页读取数量（API 最大6000，设置5000留余量）
 SLEEP_MIN = 5     # 最小睡眠时间（秒）
@@ -68,6 +69,9 @@ def get_tushare_api() -> Optional[ts.pro_api]:
 
     try:
         api = ts.pro_api(TUSHARE_TOKEN)
+        if TUSHARE_API_URL:
+            api._DataApi__http_url = TUSHARE_API_URL
+            print(f"  使用自定义 API 地址: {TUSHARE_API_URL}")
         # 测试连接
         api.trade_cal(exchange='SSE', start_date='20240101', end_date='20240101')
         print("✓ Tushare API 连接成功")

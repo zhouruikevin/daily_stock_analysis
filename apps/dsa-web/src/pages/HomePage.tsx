@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { ApiErrorAlert, ConfirmDialog, Button, EmptyState, InlineAlert } from '../components/common';
 import { DashboardStateBlock } from '../components/dashboard';
 import { StockAutocomplete } from '../components/StockAutocomplete';
-import { HistoryList } from '../components/history';
+import { HistoryList, HistoryTrend } from '../components/history';
 import { ReportMarkdown, ReportSummary } from '../components/report';
 import { TaskPanel } from '../components/tasks';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
@@ -277,6 +277,11 @@ const HomePage: React.FC = () => {
                   </Button>
                 </div>
                 <ReportSummary data={selectedReport} isHistory />
+                <HistoryTrend
+                  stockCode={selectedReport.meta.stockCode}
+                  stockName={selectedReport.meta.stockName}
+                  days={30}
+                />
               </div>
             ) : (
               <div className="flex h-full items-center justify-center">

@@ -609,6 +609,7 @@ class NotificationService(
                 ])
 
                 self._append_market_snapshot(report_lines, result)
+                self._append_history_trend(report_lines, result.code)
                 
                 # 核心看点
                 if hasattr(result, 'key_points') and result.key_points:
@@ -921,6 +922,7 @@ class NotificationService(
                     ])
 
                 self._append_market_snapshot(report_lines, result)
+                self._append_history_trend(report_lines, result.code)
                 
                 # ========== 数据透视 ==========
                 data_persp = dashboard.get('data_perspective', {}) if dashboard else {}
@@ -1217,7 +1219,10 @@ class NotificationService(
                         for check in failed_checks[:3]:
                             lines.append(f"   {check[:40]}")
                         lines.append("")
-                
+
+                # 历史趋势
+                self._append_history_trend(lines, result.code)
+
                 lines.append("---")
                 lines.append("")
         
@@ -1361,6 +1366,8 @@ class NotificationService(
                 f"{localize_operation_advice(r.operation_advice, report_language)} | "
                 f"{labels['score_label']} {r.sentiment_score} | {one}"
             )
+            # 历史趋势
+            self._append_history_trend(lines, r.code)
         lines.append("")
         lines.append(f"*{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
         return "\n".join(lines)
@@ -1397,6 +1404,7 @@ class NotificationService(
         ]
 
         self._append_market_snapshot(lines, result)
+        self._append_history_trend(lines, result.code)
         
         # 核心决策（一句话）
         one_sentence = core.get('one_sentence', result.analysis_summary) if core else result.analysis_summary
@@ -1532,6 +1540,76 @@ class NotificationService(
                 f"| {snapshot.get('price', 'N/A')} | {snapshot.get('volume_ratio', 'N/A')} | "
                 f"{snapshot.get('turnover_rate', 'N/A')} | {display_source} |",
             ])
+
+        lines.append("")
+
+    def _append_history_trend(self, lines: List[str], stock_code: str) -> None:
+        """Append history trend table for a stock to the report."""
+        try:
+            from src.storage import get_db
+            db = get_db()
+            records = db.get_daily_latest_history(code=stock_code, days=7)
+        except Exception as e:
+            logger.debug("History trend query skipped for %s: %s", stock_code, e)
+            return
+
+        if not records:
+            return
+
+        # Apply time-zone logic for today's data
+        from zoneinfo import ZoneInfo
+        from datetime import time as dt_time
+        shanghai_tz = ZoneInfo("Asia/Shanghai")
+        now_sh = datetime.now(shanghai_tz)
+        today_sh = now_sh.date()
+        before_market = now_sh.time() < dt_time(9, 30)
+
+        trend_label = "历史趋势" if self._get_report_language() == "zh" else "History Trend"
+        date_label = "日期" if self._get_report_language() == "zh" else "Date"
+        result_label = "分析结果" if self._get_report_language() == "zh" else "Advice"
+        score_label = "分数" if self._get_report_language() == "zh" else "Score"
+        change_label = "涨跌幅" if self._get_report_language() == "zh" else "Change%"
+        vol_label = "量比" if self._get_report_language() == "zh" else "Vol Ratio"
+        turn_label = "换手率" if self._get_report_language() == "zh" else "Turnover%"
+        csi2000_label = "中证2000" if self._get_report_language() == "zh" else "CSI2000"
+        chinext_label = "创业板" if self._get_report_language() == "zh" else "ChiNext"
+
+        lines.extend([
+            f"#### 📊 {trend_label}",
+            "",
+            f"| {date_label} | {result_label} | {score_label} | {change_label} | {vol_label} | {turn_label} | {csi2000_label} | {chinext_label} |",
+            "|------|------|------|-------|------|--------|--------|--------|",
+        ])
+
+        for rec in records:
+            rec_date = rec.created_at.date() if rec.created_at else None
+            if rec_date is None:
+                continue
+
+            # For today before market open, hide market data
+            hide = (rec_date == today_sh and before_market)
+
+            advice = rec.operation_advice or "--"
+            trend = rec.trend_prediction or ""
+            advice_text = f"{advice}({trend})" if trend else advice
+            score = str(rec.sentiment_score) if rec.sentiment_score is not None else "--"
+
+            def _fmt_pct(val):
+                if hide or val is None:
+                    return "--"
+                prefix = "+" if val > 0 else ""
+                return f"{prefix}{val:.2f}%"
+
+            def _fmt_num(val):
+                if hide or val is None:
+                    return "--"
+                return f"{val:.2f}"
+
+            lines.append(
+                f"| {rec_date.isoformat()} | {advice_text} | {score} "
+                f"| {_fmt_pct(rec.change_pct)} | {_fmt_num(rec.volume_ratio)} "
+                f"| {_fmt_num(rec.turnover_rate)}% | {_fmt_pct(rec.index_csi2000_pct)} | {_fmt_pct(rec.index_chinext_pct)} |"
+            )
 
         lines.append("")
 

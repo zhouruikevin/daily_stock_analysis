@@ -171,16 +171,38 @@ class TushareFetcher(BaseFetcher):
             logger.error(f"Tushare API 初始化失败: {e}")
             self._api = None
 
-    def _build_api_client(self, token: str) -> _TushareHttpClient:
+    def _build_api_client(self, token: str):
         """
-        Build a lightweight Tushare Pro client over direct HTTP requests.
+        Build a Tushare Pro API client.
 
-        The project already normalizes all Pro calls through the same request
-        contract, so we do not need the official tushare SDK during runtime.
+        When TUSHARE_API_URL is configured (e.g. a self-hosted proxy),
+        use the official tushare SDK with pro._DataApi__http_url override,
+        because the proxy token only works through the official SDK.
+
+        When TUSHARE_API_URL is not set, fall back to the built-in
+        lightweight HTTP client to avoid requiring the tushare package.
         """
-        client = _TushareHttpClient(token=token)
-        logger.debug("Tushare API client configured for direct HTTP calls")
-        return client
+        config = get_config()
+        api_url = getattr(config, 'tushare_api_url', None)
+
+        if api_url:
+            # 使用官方 tushare SDK + 自定义端点
+            try:
+                import tushare as ts
+                pro = ts.pro_api(token)
+                pro._DataApi__http_url = api_url
+                logger.info(f"Tushare API client: official SDK with custom endpoint ({api_url})")
+                return pro
+            except ImportError:
+                logger.warning("tushare SDK 未安装，回退到内置 HTTP client；代理端点可能不兼容")
+                client = _TushareHttpClient(token=token, api_url=api_url)
+                logger.debug(f"Tushare API client: built-in HTTP client (endpoint: {api_url})")
+                return client
+        else:
+            # 默认：使用内置轻量 HTTP client，无需 tushare SDK
+            client = _TushareHttpClient(token=token)
+            logger.debug("Tushare API client: built-in HTTP client (endpoint: http://api.tushare.pro)")
+            return client
 
     def _determine_priority(self) -> int:
         """
@@ -785,6 +807,7 @@ class TushareFetcher(BaseFetcher):
             '000001.SH': '上证指数',
             '399001.SZ': '深证成指',
             '399006.SZ': '创业板指',
+            '399303.SZ': '中证2000',
             '000688.SH': '科创50',
             '000016.SH': '上证50',
             '000300.SH': '沪深300',

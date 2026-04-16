@@ -438,6 +438,7 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
+    tushare_api_url: Optional[str] = None  # 自定义 TuShare Pro API 地址（默认 http://api.tushare.pro）
     tickflow_api_key: Optional[str] = None
     longbridge_app_key: Optional[str] = None
     longbridge_app_secret: Optional[str] = None
@@ -860,6 +861,18 @@ class Config:
                 '127.0.0.1'
             ]
 
+            # 自定义 TuShare API 端点也加入 NO_PROXY
+            tushare_api_url_raw = os.getenv('TUSHARE_API_URL', '').strip()
+            if tushare_api_url_raw:
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(tushare_api_url_raw)
+                    host = parsed.hostname
+                    if host and host not in domestic_domains:
+                        domestic_domains.append(host)
+                except Exception:
+                    pass
+
             # 获取现有的 no_proxy
             current_no_proxy = os.getenv('NO_PROXY') or os.getenv('no_proxy') or ''
             existing_domains = current_no_proxy.split(',') if current_no_proxy else []
@@ -1111,6 +1124,7 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            tushare_api_url=os.getenv('TUSHARE_API_URL') or None,
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
             longbridge_app_secret=os.getenv('LONGBRIDGE_APP_SECRET') or None,

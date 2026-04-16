@@ -10,6 +10,7 @@
 """
 
 import logging
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Depends, Body
@@ -28,6 +29,8 @@ from api.v1.schemas.history import (
     ReportStrategy,
     ReportDetails,
     MarkdownReportResponse,
+    HistoryTrendItem,
+    HistoryTrendResponse,
 )
 from api.v1.schemas.common import ErrorResponse
 from src.storage import DatabaseManager
@@ -127,6 +130,75 @@ def get_history_list(
                 "message": f"查询历史列表失败: {str(e)}"
             }
         )
+
+
+@router.get(
+    "/trend",
+    response_model=HistoryTrendResponse,
+    responses={
+        200: {"description": "历史趋势数据"},
+        400: {"description": "参数错误", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="获取股票历史趋势",
+)
+async def get_history_trend(
+    stock_code: str = Query(..., description="股票代码"),
+    days: int = Query(30, ge=1, le=365, description="查询天数"),
+    db: DatabaseManager = Depends(get_database_manager),
+):
+    """获取指定股票的按天历史趋势数据。
+
+    同一天内多条记录取最后一条。当日数据根据时间区间判断是否展示行情字段：
+    - 0:00-9:30（未开盘）：行情字段返回 null
+    - 9:30-15:00（盘中）和 15:00-24:00（收盘后）：返回实际值
+    """
+    from datetime import date as date_type
+    from zoneinfo import ZoneInfo
+
+    try:
+        records = db.get_daily_latest_history(code=stock_code, days=days)
+    except Exception as e:
+        logger.error(f"查询历史趋势失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": f"查询历史趋势失败: {str(e)}"},
+        )
+
+    shanghai_tz = ZoneInfo("Asia/Shanghai")
+    now_shanghai = datetime.now(shanghai_tz)
+    today_shanghai = now_shanghai.date()
+
+    items = []
+    for record in records:
+        record_date = record.created_at.date() if record.created_at else None
+        if record_date is None:
+            continue
+
+        # 当日时间区间判断
+        is_today = (record_date == today_shanghai)
+        hide_market_data = False
+        if is_today:
+            current_time = now_shanghai.time()
+            # 0:00-9:30 未开盘，不展示行情数据
+            from datetime import time as dt_time
+            if current_time < dt_time(9, 30):
+                hide_market_data = True
+
+        items.append(HistoryTrendItem(
+            date=record_date.isoformat(),
+            stock_name=record.name,
+            operation_advice=record.operation_advice,
+            trend_prediction=record.trend_prediction,
+            sentiment_score=record.sentiment_score,
+            change_pct=None if hide_market_data else record.change_pct,
+            volume_ratio=None if hide_market_data else record.volume_ratio,
+            turnover_rate=None if hide_market_data else record.turnover_rate,
+            index_csi2000_pct=None if hide_market_data else record.index_csi2000_pct,
+            index_chinext_pct=None if hide_market_data else record.index_chinext_pct,
+        ))
+
+    return HistoryTrendResponse(stock_code=stock_code, items=items)
 
 
 @router.delete(
@@ -459,3 +531,4 @@ def get_history_markdown(
         )
 
     return MarkdownReportResponse(content=markdown_content)
+

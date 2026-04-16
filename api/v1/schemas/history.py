@@ -206,3 +206,53 @@ class MarkdownReportResponse(BaseModel):
                 "content": "# 📊 贵州茅台 (600519) 分析报告\n\n> 分析日期：**2024-01-01**\n\n..."
             }
         }
+
+
+class HistoryTrendItem(BaseModel):
+    """历史趋势单日条目"""
+
+    model_config = ConfigDict(
+        protected_namespaces=("model_validate", "model_dump"),
+        json_schema_extra={
+            "example": {
+                "date": "2026-04-14",
+                "stock_name": "工业富联",
+                "operation_advice": "买入",
+                "trend_prediction": "看多",
+                "sentiment_score": 76,
+                "change_pct": -1.87,
+                "volume_ratio": 1.2,
+                "turnover_rate": 3.4,
+                "index_csi2000_pct": 0.8,
+                "index_chinext_pct": -0.2,
+            }
+        },
+    )
+
+    date: str = Field(..., description="日期（YYYY-MM-DD）")
+    stock_name: Optional[str] = Field(None, description="股票名称")
+    operation_advice: Optional[str] = Field(None, description="操作建议")
+    trend_prediction: Optional[str] = Field(None, description="趋势预测")
+    sentiment_score: Optional[int] = Field(None, description="情绪评分")
+    change_pct: Optional[float] = Field(None, description="当日涨跌幅(%)")
+    volume_ratio: Optional[float] = Field(None, description="量比")
+    turnover_rate: Optional[float] = Field(None, description="换手率(%)")
+    index_csi2000_pct: Optional[float] = Field(None, description="中证2000涨跌幅(%)")
+    index_chinext_pct: Optional[float] = Field(None, description="创业板涨跌幅(%)")
+
+
+class HistoryTrendResponse(BaseModel):
+    """历史趋势响应"""
+
+    model_config = ConfigDict(
+        protected_namespaces=("model_validate", "model_dump"),
+        json_schema_extra={
+            "example": {
+                "stock_code": "600519",
+                "items": [],
+            }
+        },
+    )
+
+    stock_code: str = Field(..., description="股票代码")
+    items: List[HistoryTrendItem] = Field(default_factory=list, description="趋势条目列表")
