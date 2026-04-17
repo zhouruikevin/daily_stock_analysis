@@ -1093,11 +1093,31 @@ class StockAnalysisPipeline:
             df = pd.concat([df, new_df], ignore_index=True)
         return df
 
+    def _prefetch_index_snapshot(self) -> None:
+        """在批量分析开始时预取指数数据（中证2000、创业板指）。
+
+        只获取一次，所有 A 股共享，避免逐股重复调用。
+        获取失败不阻断主流程，_backfill_index_data_for_stock 会跳过。
+        """
+        self._index_snapshot: Dict[str, Optional[float]] = {"csi2000_pct": None, "chinext_pct": None}
+        try:
+            # 使用轻量接口，只获取中证2000和创业板指的涨跌幅
+            pct_map = self.fetcher_manager.get_index_change_pct(['399303', '399006'])
+            self._index_snapshot["csi2000_pct"] = pct_map.get('399303')
+            self._index_snapshot["chinext_pct"] = pct_map.get('399006')
+
+            logger.info(
+                f"[指数预取] 成功: 中证2000={self._index_snapshot['csi2000_pct']}, "
+                f"创业板={self._index_snapshot['chinext_pct']}"
+            )
+        except Exception as exc:
+            logger.debug(f"[指数预取] 失败（不影响主流程）: {exc}")
+
     def _backfill_index_data_for_stock(self, code: str) -> None:
-        """获取当天指数涨跌幅并回写到该股票的历史记录中。
+        """将预取的指数涨跌幅回写到该股票的历史记录中。
 
         仅对 A 股代码执行，非 A 股跳过。
-        获取失败不影响主流程。
+        数据来自 _prefetch_index_snapshot 的本轮缓存，不重复拉取。
         """
         from data_provider.base import normalize_stock_code as _norm
 
@@ -1106,25 +1126,16 @@ class StockAnalysisPipeline:
         if not (len(normalized) == 6 and normalized.isdigit()):
             return
 
-        try:
-            indices = self.fetcher_manager.get_main_indices(region="cn")
-            if not indices:
-                return
+        # 从本轮预取缓存读取
+        snapshot = getattr(self, "_index_snapshot", None)
+        if not snapshot:
+            return
 
-            csi2000_pct = None
-            chinext_pct = None
-            for idx in indices:
-                idx_code = str(idx.get("code", ""))
-                name = idx.get("name", "")
-                pct = idx.get("change_pct")
-                # 中证2000: 399303
-                if idx_code == "399303" or "中证2000" in name:
-                    csi2000_pct = pct
-                # 创业板指: 399006
-                elif idx_code == "399006" or "创业板" in name:
-                    chinext_pct = pct
+        csi2000_pct = snapshot.get("csi2000_pct")
+        chinext_pct = snapshot.get("chinext_pct")
 
-            if csi2000_pct is not None or chinext_pct is not None:
+        if csi2000_pct is not None or chinext_pct is not None:
+            try:
                 rows = self.db.update_index_data_for_today(
                     code=code,
                     csi2000_pct=csi2000_pct,
@@ -1132,8 +1143,8 @@ class StockAnalysisPipeline:
                 )
                 if rows:
                     logger.debug(f"[{code}] 已回写指数数据: 中证2000={csi2000_pct}, 创业板={chinext_pct}")
-        except Exception:
-            pass  # 不影响主流程
+            except Exception as exc:
+                logger.debug(f"[{code}] 回写指数数据失败: {exc}")
 
     def _build_context_snapshot(
         self,
@@ -1349,7 +1360,11 @@ class StockAnalysisPipeline:
 
         # 冻结本轮运行的统一参考时间，避免跨市场收盘边界时同批股票使用不同目标交易日。
         resume_reference_time = datetime.now(timezone.utc)
-        
+
+        # === 批量预取指数数据（中证2000、创业板指等）===
+        # 每轮分析只获取一次，所有 A 股共享，避免逐股重复拉取
+        self._prefetch_index_snapshot()
+
         # === 批量预取实时行情（优化：避免每只股票都触发全量拉取）===
         # 只有股票数量 >= 5 时才进行预取，少量股票直接逐个查询更高效
         if len(stock_codes) >= 5:

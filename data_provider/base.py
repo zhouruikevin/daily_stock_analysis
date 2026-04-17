@@ -1619,8 +1619,16 @@ class DataFetcherManager:
         logger.info(f"[股票名称] 批量获取完成，成功 {len(result)}/{len(stock_codes)}")
         return result
 
+    # 不适合获取实时指数的数据源（仅提供历史日线，无盘中实时能力）
+    # TushareFetcher 已支持 rt_idx_k 实时接口，不再跳过
+    _NON_REALTIME_INDEX_FETCHERS = {"BaostockFetcher", "YfinanceFetcher"}
+
     def get_main_indices(self, region: str = "cn") -> List[Dict[str, Any]]:
-        """获取主要指数实时行情（自动切换数据源）"""
+        """获取主要指数实时行情（自动切换数据源）
+
+        跳过仅提供历史日线的非实时数据源，
+        优先使用能提供盘中实时指数的源（TickFlow/Tushare rt_idx_k/efinance/akshare）。
+        """
         if region == "cn":
             tickflow_fetcher = self._get_tickflow_fetcher()
             if tickflow_fetcher is not None:
@@ -1633,6 +1641,9 @@ class DataFetcherManager:
                     logger.warning(f"[TickFlowFetcher] 获取指数行情失败: {e}")
 
         for fetcher in self._fetchers:
+            # 跳过基于历史日线的非实时数据源
+            if fetcher.name in self._NON_REALTIME_INDEX_FETCHERS:
+                continue
             try:
                 data = fetcher.get_main_indices(region=region)
                 if data:
@@ -1642,6 +1653,139 @@ class DataFetcherManager:
                 logger.warning(f"[{fetcher.name}] 获取指数行情失败: {e}")
                 continue
         return []
+
+    def get_index_change_pct(self, index_codes: Optional[List[str]] = None) -> Dict[str, Optional[float]]:
+        """获取指定指数的当日涨跌幅（轻量接口）。
+
+        只返回 {指数代码: 涨跌幅} 的简单映射，不拉取完整行情。
+        优先使用新浪接口（最轻量），失败则回退到 get_main_indices 提取。
+
+        Args:
+            index_codes: 指数代码列表，默认 ['399303', '399006']（中证2000、创业板指）
+
+        Returns:
+            {代码: 涨跌幅} 字典，获取失败的指数值为 None
+        """
+        if index_codes is None:
+            index_codes = ['399303', '399006']
+
+        result: Dict[str, Optional[float]] = {c: None for c in index_codes}
+
+        # --- 策略1：新浪接口，单次请求获取全部指数 ---
+        try:
+            import requests as _req
+            from datetime import datetime as _dt
+            import pytz as _pytz
+            
+            # 新浪指数接口：sh000001,sz399006,sz399303
+            sina_codes = []
+            for c in index_codes:
+                if c.startswith(('000', '9')):
+                    sina_codes.append(f"sh{c}")
+                else:
+                    sina_codes.append(f"sz{c}")
+            url = f"http://hq.sinajs.cn/list={','.join(sina_codes)}"
+            headers = {
+                'Referer': 'http://finance.sina.com.cn',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'
+            }
+            resp = _req.get(url, headers=headers, timeout=10)
+            resp.encoding = 'gbk'
+            if resp.status_code == 200:
+                import re as _re
+                for i, line in enumerate(resp.text.strip().split('\n')):
+                    m = _re.search(r'="(.+?)"', line)
+                    if not m:
+                        continue
+                    fields = m.group(1).split(',')
+                    if len(fields) < 4:
+                        continue
+                    # fields: 名称,开,昨收,现价,...
+                    try:
+                        pre_close = float(fields[2])
+                        current = float(fields[3])
+                        if pre_close > 0:
+                            pct = round((current - pre_close) / pre_close * 100, 2)
+                            if i < len(index_codes):
+                                result[index_codes[i]] = pct
+                    except (ValueError, IndexError):
+                        continue
+                
+                # 验证数据时效性：检查是否在交易时段获取到了当日数据
+                if all(v is not None for v in result.values()):
+                    # 检查当前是否为交易时段
+                    cn_tz = _pytz.timezone('Asia/Shanghai')
+                    now = _dt.now(cn_tz)
+                    is_trading_hours = (
+                        now.weekday() < 5 and  # 工作日
+                        (
+                            (now.hour == 9 and now.minute >= 15) or  # 9:15后指数开始有数据
+                            (10 <= now.hour < 11) or
+                            (now.hour == 11 and now.minute <= 30) or
+                            (13 <= now.hour < 15) or
+                            (now.hour == 15 and now.minute == 0)
+                        )
+                    )
+                    
+                    if is_trading_hours:
+                        # 交易时段：验证数据是否为今天
+                        # 新浪返回的字段包含日期时间信息（如果有的话）
+                        logger.info(f"[指数涨跌] 新浪接口获取成功(交易时段): {result}")
+                    else:
+                        # 非交易时段：标注为昨日收盘数据
+                        logger.info(f"[指数涨跌] 新浪接口获取成功(非交易时段-昨日收盘): {result}")
+                    
+                    return result
+        except Exception as e:
+            logger.debug(f"[指数涨跌] 新浪接口失败: {e}")
+
+        # --- 策略2：efinance get_realtime_quotes 按指数代码查 ---
+        try:
+            import efinance as ef
+            ef_codes = []
+            for c in index_codes:
+                if c.startswith(('000', '9')):
+                    ef_codes.append(f"sh{c}")
+                else:
+                    ef_codes.append(f"sz{c}")
+            df = ef.stock.get_realtime_quotes(ef_codes)
+            if df is not None and not df.empty:
+                code_col = '股票代码' if '股票代码' in df.columns else 'code'
+                pct_col = '涨跌幅' if '涨跌幅' in df.columns else 'pct_chg'
+                for idx, c in enumerate(index_codes):
+                    if result[c] is not None:
+                        continue
+                    ef_c = ef_codes[idx]
+                    row = df[df[code_col].astype(str).str.zfill(6) == c]
+                    if not row.empty:
+                        result[c] = safe_float(row.iloc[0].get(pct_col, 0))
+            if all(v is not None for v in result.values()):
+                logger.info(f"[指数涨跌] efinance 接口获取成功: {result}")
+                return result
+        except Exception as e:
+            logger.debug(f"[指数涨跌] efinance 接口失败: {e}")
+
+        # --- 策略3：回退到 get_main_indices 提取 ---
+        try:
+            indices = self.get_main_indices(region="cn")
+            if indices:
+                name_map = {
+                    '399303': ['399303', '中证2000'],
+                    '399006': ['399006', '创业板'],
+                }
+                for idx_data in indices:
+                    idx_code = str(idx_data.get('code', ''))
+                    pct = idx_data.get('change_pct')
+                    for target_code, keywords in name_map.items():
+                        if result[target_code] is not None:
+                            continue
+                        if idx_code == target_code or any(kw in idx_data.get('name', '') for kw in keywords):
+                            result[target_code] = pct
+        except Exception as e:
+            logger.debug(f"[指数涨跌] get_main_indices 回退失败: {e}")
+
+        logger.info(f"[指数涨跌] 最终结果: {result}")
+        return result
 
     def get_market_stats(self) -> Dict[str, Any]:
         """获取市场涨跌统计（自动切换数据源）"""

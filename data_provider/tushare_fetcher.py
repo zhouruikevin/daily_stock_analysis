@@ -794,6 +794,9 @@ class TushareFetcher(BaseFetcher):
     def get_main_indices(self, region: str = "cn") -> Optional[List[dict]]:
         """
         获取主要指数实时行情 (Tushare Pro)，仅支持 A 股
+
+        优先使用 rt_idx_k 接口获取盘中实时指数数据（需单独开权限）；
+        若不可用则回退到 index_daily 获取最近交易日收盘数据。
         """
         if region != "cn":
             return None
@@ -816,50 +819,116 @@ class TushareFetcher(BaseFetcher):
         try:
             self._check_rate_limit()
 
-            # Tushare index_daily 获取历史数据，实时数据需用其他接口或估算
-            # 由于 Tushare 免费用户可能无法获取指数实时行情，这里作为备选
-            # 使用 index_daily 获取最近交易日数据
+            # ---- 优先：rt_idx_k 实时指数接口 ----
+            realtime_results = self._get_indices_realtime(indices_map, safe_float)
+            if realtime_results is not None:
+                return realtime_results
 
-            end_date = datetime.now().strftime('%Y%m%d')
-            start_date = (datetime.now() - pd.Timedelta(days=5)).strftime('%Y%m%d')
-
-            results = []
-
-            # 批量获取所有指数数据
-            for ts_code, name in indices_map.items():
-                try:
-                    df = self._api.index_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
-                    if df is not None and not df.empty:
-                        row = df.iloc[0] # 最新一天
-
-                        current = safe_float(row['close'])
-                        prev_close = safe_float(row['pre_close'])
-
-                        results.append({
-                            'code': ts_code.split('.')[0], # 兼容 sh000001 格式需转换，这里保持纯数字
-                            'name': name,
-                            'current': current,
-                            'change': safe_float(row['change']),
-                            'change_pct': safe_float(row['pct_chg']),
-                            'open': safe_float(row['open']),
-                            'high': safe_float(row['high']),
-                            'low': safe_float(row['low']),
-                            'prev_close': prev_close,
-                            'volume': safe_float(row['vol']),
-                            'amount': safe_float(row['amount']) * 1000, # 千元转元
-                            'amplitude': 0.0 # Tushare index_daily 不直接返回振幅
-                        })
-                except Exception as e:
-                    logger.debug(f"Tushare 获取指数 {name} 失败: {e}")
-                    continue
-
-            if results:
-                return results
-            else:
-                logger.warning("[Tushare] 未获取到指数行情数据")
+            # ---- 回退：index_daily 最近交易日收盘数据 ----
+            return self._get_indices_daily(indices_map, safe_float)
 
         except Exception as e:
             logger.error(f"[Tushare] 获取指数行情失败: {e}")
+
+        return None
+
+    def _get_indices_realtime(
+        self,
+        indices_map: dict,
+        safe_float: Any,
+    ) -> Optional[List[dict]]:
+        """通过 rt_idx_k 接口获取盘中实时指数行情。
+
+        该接口需单独开权限，不可用时返回 None 以便回退。
+        """
+        try:
+            ts_codes = ",".join(indices_map.keys())
+            df = self._api.rt_idx_k(ts_code=ts_codes)
+            if df is None or df.empty:
+                return None
+
+            results = []
+            for ts_code, name in indices_map.items():
+                row = df[df['ts_code'] == ts_code]
+                if row.empty:
+                    continue
+                r = row.iloc[0]
+                current = safe_float(r.get('close', 0))
+                prev_close = safe_float(r.get('pre_close', 0))
+                change = current - prev_close if current and prev_close else 0.0
+                change_pct = (change / prev_close * 100) if prev_close else 0.0
+                results.append({
+                    'code': ts_code.split('.')[0],
+                    'name': name,
+                    'current': current,
+                    'change': safe_float(change),
+                    'change_pct': safe_float(change_pct),
+                    'open': safe_float(r.get('open', 0)),
+                    'high': safe_float(r.get('high', 0)),
+                    'low': safe_float(r.get('low', 0)),
+                    'prev_close': prev_close,
+                    'volume': safe_float(r.get('vol', 0)),
+                    'amount': safe_float(r.get('amount', 0)),
+                    'amplitude': 0.0,
+                })
+
+            if results:
+                logger.info(f"[Tushare] rt_idx_k 实时指数获取成功: {len(results)} 个")
+                return results
+
+        except AttributeError:
+            # 自研 HTTP client 不支持 rt_idx_k 方法
+            logger.debug("[Tushare] rt_idx_k 接口不可用（当前 client 不支持），回退 index_daily")
+        except Exception as e:
+            logger.debug(f"[Tushare] rt_idx_k 接口不可用，回退 index_daily: {e}")
+
+        return None
+
+    def _get_indices_daily(
+        self,
+        indices_map: dict,
+        safe_float: Any,
+    ) -> Optional[List[dict]]:
+        """通过 index_daily 获取最近交易日收盘数据（大盘复盘等场景）。
+
+        注意：返回的是最近交易日收盘数据，非盘中实时数据。
+        """
+        end_date = datetime.now().strftime('%Y%m%d')
+        start_date = (datetime.now() - pd.Timedelta(days=5)).strftime('%Y%m%d')
+
+        results = []
+        for ts_code, name in indices_map.items():
+            try:
+                df = self._api.index_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+                if df is not None and not df.empty:
+                    row = df.iloc[0]  # 最新一天
+
+                    current = safe_float(row['close'])
+                    prev_close = safe_float(row['pre_close'])
+
+                    results.append({
+                        'code': ts_code.split('.')[0],
+                        'name': name,
+                        'current': current,
+                        'change': safe_float(row['change']),
+                        'change_pct': safe_float(row['pct_chg']),
+                        'open': safe_float(row['open']),
+                        'high': safe_float(row['high']),
+                        'low': safe_float(row['low']),
+                        'prev_close': prev_close,
+                        'volume': safe_float(row['vol']),
+                        'amount': safe_float(row['amount']) * 1000,  # 千元转元
+                        'amplitude': 0.0,
+                    })
+            except Exception as e:
+                logger.debug(f"Tushare 获取指数 {name} 失败: {e}")
+                continue
+
+        if results:
+            logger.info(f"[Tushare] index_daily 指数获取成功: {len(results)} 个")
+            return results
+        else:
+            logger.warning("[Tushare] 未获取到指数行情数据")
 
         return None
 

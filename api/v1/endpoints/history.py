@@ -152,8 +152,11 @@ async def get_history_trend(
     同一天内多条记录取最后一条。当日数据根据时间区间判断是否展示行情字段：
     - 0:00-9:30（未开盘）：行情字段返回 null
     - 9:30-15:00（盘中）和 15:00-24:00（收盘后）：返回实际值
+
+    盘中时段会主动刷新今日记录的指数（中证2000、创业板）数据，
+    避免展示过期的指数快照。
     """
-    from datetime import date as date_type
+    from datetime import date as date_type, time as dt_time
     from zoneinfo import ZoneInfo
 
     try:
@@ -169,6 +172,12 @@ async def get_history_trend(
     now_shanghai = datetime.now(shanghai_tz)
     today_shanghai = now_shanghai.date()
 
+    # 盘中时段：主动刷新今日记录的指数数据
+    current_time_sh = now_shanghai.time()
+    market_open = dt_time(9, 30) <= current_time_sh
+    if market_open and records:
+        _refresh_today_index_data(db, stock_code, records, today_shanghai)
+
     items = []
     for record in records:
         record_date = record.created_at.date() if record.created_at else None
@@ -179,10 +188,8 @@ async def get_history_trend(
         is_today = (record_date == today_shanghai)
         hide_market_data = False
         if is_today:
-            current_time = now_shanghai.time()
             # 0:00-9:30 未开盘，不展示行情数据
-            from datetime import time as dt_time
-            if current_time < dt_time(9, 30):
+            if current_time_sh < dt_time(9, 30):
                 hide_market_data = True
 
         items.append(HistoryTrendItem(
@@ -531,4 +538,70 @@ def get_history_markdown(
         )
 
     return MarkdownReportResponse(content=markdown_content)
+
+
+# ============================================================
+# 辅助函数
+# ============================================================
+
+def _refresh_today_index_data(
+    db: "DatabaseManager",
+    stock_code: str,
+    records: list,
+    today: "date",
+) -> None:
+    """盘中刷新今日记录的中证2000/创业板指数数据。
+
+    对 records 中属于今日的记录，从实时数据源拉取最新指数涨跌幅，
+    回写到数据库并刷新 ORM 对象属性，使后续读取能拿到最新值。
+    失败不影响主流程（仅 debug 日志）。
+    """
+    from data_provider.base import normalize_stock_code as _norm
+
+    # 仅 A 股需要刷新指数
+    normalized = _norm(stock_code)
+    if not (len(normalized) == 6 and normalized.isdigit()):
+        return
+
+    # 找到今日记录
+    today_records = [
+        r for r in records
+        if r.created_at and r.created_at.date() == today
+    ]
+    if not today_records:
+        return
+
+    try:
+        from data_provider.base import DataFetcherManager
+        manager = DataFetcherManager()
+        # 使用轻量接口，只获取涨跌幅，避免 get_main_indices 的全量行情开销
+        pct_map = manager.get_index_change_pct(['399303', '399006'])
+
+        csi2000_pct = pct_map.get('399303')
+        chinext_pct = pct_map.get('399006')
+
+        if csi2000_pct is None and chinext_pct is None:
+            return
+
+        # 回写数据库（update_index_data_for_today 已改为允许覆盖）
+        rows = db.update_index_data_for_today(
+            code=stock_code,
+            csi2000_pct=csi2000_pct,
+            chinext_pct=chinext_pct,
+        )
+        if rows:
+            logger.debug(
+                f"[trend-refresh] {stock_code} 指数数据已刷新: "
+                f"中证2000={csi2000_pct}, 创业板={chinext_pct}"
+            )
+
+        # 刷新 ORM 对象属性，使后续读取能拿到最新值
+        for rec in today_records:
+            if csi2000_pct is not None:
+                rec.index_csi2000_pct = csi2000_pct
+            if chinext_pct is not None:
+                rec.index_chinext_pct = chinext_pct
+
+    except Exception as e:
+        logger.debug(f"[trend-refresh] {stock_code} 刷新指数数据失败（不影响主流程）: {e}")
 
