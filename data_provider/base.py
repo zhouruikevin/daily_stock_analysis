@@ -1737,7 +1737,7 @@ class DataFetcherManager:
                     
                     return result
         except Exception as e:
-            logger.debug(f"[指数涨跌] 新浪接口失败: {e}")
+            logger.warning(f"[指数涨跌] 新浪接口失败: {e}")
 
         # --- 策略2：efinance get_realtime_quotes 按指数代码查 ---
         try:
@@ -1763,7 +1763,7 @@ class DataFetcherManager:
                 logger.info(f"[指数涨跌] efinance 接口获取成功: {result}")
                 return result
         except Exception as e:
-            logger.debug(f"[指数涨跌] efinance 接口失败: {e}")
+            logger.warning(f"[指数涨跌] efinance 接口失败: {e}")
 
         # --- 策略3：回退到 get_main_indices 提取 ---
         try:
@@ -1782,7 +1782,7 @@ class DataFetcherManager:
                         if idx_code == target_code or any(kw in idx_data.get('name', '') for kw in keywords):
                             result[target_code] = pct
         except Exception as e:
-            logger.debug(f"[指数涨跌] get_main_indices 回退失败: {e}")
+            logger.warning(f"[指数涨跌] get_main_indices 回退失败: {e}")
 
         logger.info(f"[指数涨跌] 最终结果: {result}")
         return result
