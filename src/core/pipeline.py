@@ -1094,30 +1094,51 @@ class StockAnalysisPipeline:
         return df
 
     def _prefetch_index_snapshot(self) -> None:
-        """在批量分析开始时预取指数数据（中证2000、创业板指）。
-
-        只获取一次，所有 A 股共享，避免逐股重复调用。
-        获取失败不阻断主流程，_backfill_index_data_for_stock 会跳过。
+        """在批量分析开始时预取指数数据(中证2000、创业板指)。
+    
+        只获取一次,所有 A 股共享,避免逐股重复调用。
+        增强容错:支持重试机制,确保指数数据可靠性。
         """
         self._index_snapshot: Dict[str, Optional[float]] = {"csi2000_pct": None, "chinext_pct": None}
-        try:
-            # 使用轻量接口，只获取中证2000和创业板指的涨跌幅
-            pct_map = self.fetcher_manager.get_index_change_pct(['399303', '399006'])
-            self._index_snapshot["csi2000_pct"] = pct_map.get('399303')
-            self._index_snapshot["chinext_pct"] = pct_map.get('399006')
-
-            logger.info(
-                f"[指数预取] 成功: 中证2000={self._index_snapshot['csi2000_pct']}, "
-                f"创业板={self._index_snapshot['chinext_pct']}"
-            )
-        except Exception as exc:
-            logger.debug(f"[指数预取] 失败（不影响主流程）: {exc}")
+            
+        # 最多重试2次,提高成功率
+        max_retries = 2
+        for attempt in range(1, max_retries + 1):
+            try:
+                # 使用轻量接口,只获取中证2000和创业板指的涨跌幅
+                pct_map = self.fetcher_manager.get_index_change_pct(['399303', '399006'])
+                self._index_snapshot["csi2000_pct"] = pct_map.get('399303')
+                self._index_snapshot["chinext_pct"] = pct_map.get('399006')
+    
+                # 验证数据有效性
+                if self._index_snapshot["csi2000_pct"] is not None or self._index_snapshot["chinext_pct"] is not None:
+                    logger.info(
+                        f"[指数预取] 成功(第{attempt}次): 中证2000={self._index_snapshot['csi2000_pct']}, "
+                        f"创业板={self._index_snapshot['chinext_pct']}"
+                    )
+                    return  # 成功获取,直接返回
+                else:
+                    logger.warning(f"[指数预取] 第{attempt}次获取结果为空,准备重试...")
+            except Exception as exc:
+                logger.warning(f"[指数预取] 第{attempt}次异常: {exc}")
+                
+            # 重试前等待1秒
+            if attempt < max_retries:
+                import time
+                time.sleep(1)
+            
+        # 所有重试都失败
+        logger.error(
+            f"[指数预取] 全部失败! 中证2000={self._index_snapshot['csi2000_pct']}, "
+            f"创业板={self._index_snapshot['chinext_pct']}。历史趋势将缺失指数数据。"
+        )
 
     def _backfill_index_data_for_stock(self, code: str) -> None:
         """将预取的指数涨跌幅回写到该股票的历史记录中。
 
         仅对 A 股代码执行，非 A 股跳过。
         数据来自 _prefetch_index_snapshot 的本轮缓存，不重复拉取。
+        兜底机制:如果预取缓存为 None，则实时拉取一次，确保数据完整性。
         """
         from data_provider.base import normalize_stock_code as _norm
 
@@ -1133,6 +1154,28 @@ class StockAnalysisPipeline:
 
         csi2000_pct = snapshot.get("csi2000_pct")
         chinext_pct = snapshot.get("chinext_pct")
+
+        # 兜底机制:如果预取失败(为 None)，则实时拉取一次
+        if csi2000_pct is None and chinext_pct is None:
+            try:
+                logger.warning(f"[{code}] 预取指数数据为空，尝试实时拉取...")
+                pct_map = self.fetcher_manager.get_index_change_pct(['399303', '399006'])
+                csi2000_pct = pct_map.get('399303')
+                chinext_pct = pct_map.get('399006')
+                
+                if csi2000_pct is not None or chinext_pct is not None:
+                    logger.info(
+                        f"[{code}] 实时拉取指数数据成功: 中证2000={csi2000_pct}, 创业板={chinext_pct}"
+                    )
+                    # 更新缓存，后续股票可以直接使用
+                    snapshot["csi2000_pct"] = csi2000_pct
+                    snapshot["chinext_pct"] = chinext_pct
+                else:
+                    logger.warning(f"[{code}] 实时拉取指数数据仍为空，跳过回写")
+                    return
+            except Exception as exc:
+                logger.warning(f"[{code}] 实时拉取指数数据失败: {exc}")
+                return
 
         if csi2000_pct is not None or chinext_pct is not None:
             try:
@@ -1273,6 +1316,10 @@ class StockAnalysisPipeline:
         logger.info(f"========== 开始处理 {code} ==========")
         
         try:
+            # 预取指数数据(单股分析也需要)
+            if not hasattr(self, '_index_snapshot') or self._index_snapshot is None:
+                self._prefetch_index_snapshot()
+            
             self._emit_progress(12, f"{code}：正在准备分析任务")
             # Step 1: 获取并保存数据
             success, error = self.fetch_and_save_stock_data(
