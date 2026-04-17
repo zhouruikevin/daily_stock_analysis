@@ -1292,8 +1292,8 @@ class DatabaseManager:
     ) -> int:
         """回写当天该股票历史记录的指数涨跌幅。
 
-        如果已有值则跳过（不覆盖），仅在 NULL 时回填。
         对同一天同一股票的所有记录统一更新。
+        允许覆盖已有值，确保盘中多次分析时指数数据保持最新。
 
         Returns:
             更新的行数
@@ -1308,7 +1308,7 @@ class DatabaseManager:
                 conditions = []
                 params: Dict[str, Any] = {"code": code}
 
-                # 仅更新当天且字段为 NULL 的记录
+                # 仅更新当天的记录
                 conditions.append("code = :code")
                 conditions.append("DATE(created_at) = DATE('now', 'localtime')")
 
@@ -1316,11 +1316,9 @@ class DatabaseManager:
                 if csi2000_pct is not None:
                     set_clauses.append("index_csi2000_pct = :csi2000")
                     params["csi2000"] = csi2000_pct
-                    conditions.append("index_csi2000_pct IS NULL")
                 if chinext_pct is not None:
                     set_clauses.append("index_chinext_pct = :chinext")
                     params["chinext"] = chinext_pct
-                    conditions.append("index_chinext_pct IS NULL")
 
                 if not set_clauses:
                     return 0

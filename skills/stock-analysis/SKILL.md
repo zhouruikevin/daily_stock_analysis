@@ -12,7 +12,49 @@ description: >
 
 跨平台股票分析技能,支持 A股/港股/美股智能分析。
 
+## ⛔ 执行约束（必须遵守）
+
+1. **不要向用户询问任何配置信息**。所有配置（LLM 模型、API Key、数据源等）已预置在项目 `.env` 文件中，直接使用即可。
+2. **不要提示"缺少核心代码文件"**。本 Skill 是项目的组成部分，代码就在项目目录中，Skill 目录只存放 Skill 描述文件。
+3. **不要询问"使用哪个 LLM 提供商和模型"**。LLM 配置已在 `.env` 中设定（当前为 `openai/glm-4.6`），无需用户干预。
+4. **分析时间较长时（超过 60 秒），每隔约 1 分钟向用户反馈一次进度**，不要沉默等待。
+5. **直接执行分析，不要问"是否需要启动服务"之类的确认**。如果服务未运行，自动启动即可。
+6. **使用 Skill 分析股票时默认不进行大盘复盘**。只分析用户指定的股票，不触发 `--market-review`，除非用户明确要求。
+
+## 项目信息
+
+- **项目路径**：`/Users/eleme/Documents/ai/qoderwork/daily_stock_analysis`
+- **LLM 配置**：已在项目 `.env` 中配置（`LITELLM_MODEL=openai/glm-4.6`）
+- **数据源**：AkShare（免费默认）+ 可选 Tushare/Longbridge
+- **Skill 目录只是文档**：`.qoder/skills/stock-analysis/` 仅存放 Skill 描述，核心代码在 `src/`、`data_provider/` 等目录
+
 ## 快速开始
+
+### 0. 确保服务运行（首次必做）
+
+**自动启动服务**：
+```bash
+# 使用管理脚本（推荐）
+bash scripts/manage_service.sh start
+
+# 或手动启动
+python main.py --serve-only
+```
+
+**服务管理**：
+```bash
+bash scripts/manage_service.sh status   # 查看状态
+bash scripts/manage_service.sh stop     # 停止服务
+bash scripts/manage_service.sh restart  # 重启服务
+```
+
+**服务地址**：`http://localhost:8000`  
+**日志位置**：`/tmp/dsa_server.log`
+
+**⚠️ 重要：Skill 执行分析时默认跳过大盘复盘**
+- 用户要求分析股票时，只分析指定的股票
+- 只有用户明确要求「大盘复盘」、「市场综述」、「market review」时，才执行 `python main.py --market-review`
+- 这样可以节省 2-3 分钟分析时间
 
 ### 执行优先级
 
@@ -66,13 +108,13 @@ status = requests.get("http://localhost:8000/api/v1/analysis/status/{task_id}")
 ### 方式 C: CLI 命令
 
 ```bash
-# 单只股票
-python main.py --stocks 600519
+# 单只股票（默认不进行大盘复盘）
+python main.py --stocks 600519 --no-market-review
 
-# 多只股票
-python main.py --stocks 600519,000001,AAPL
+# 多只股票（默认不进行大盘复盘）
+python main.py --stocks 600519,000001,AAPL --no-market-review
 
-# 大盘复盘
+# 大盘复盘（仅当用户明确要求时执行）
 python main.py --market-review
 ```
 
