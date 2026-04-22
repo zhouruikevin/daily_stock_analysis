@@ -23,11 +23,24 @@ from src.core.market_review import run_market_review
 
 
 
+def _get_default_notifier() -> Optional[NotificationService]:
+    """获取默认通知服务（当未显式传入notifier时自动检测邮件配置）"""
+    try:
+        notifier = NotificationService()
+        # 只有当至少有一个渠道可用时才返回
+        if notifier.is_available():
+            return notifier
+    except Exception:
+        pass
+    return None
+
+
 def analyze_stock(
     stock_code: str,
     config: Config = None,
     full_report: bool = False,
-    notifier: Optional[NotificationService] = None
+    notifier: Optional[NotificationService] = None,
+    _no_auto_notify: bool = False
 ) -> Optional[AnalysisResult]:
     """
     分析单只股票
@@ -36,13 +49,18 @@ def analyze_stock(
         stock_code: 股票代码
         config: 配置对象（可选，默认使用单例）
         full_report: 是否生成完整报告
-        notifier: 通知服务（可选）
+        notifier: 通知服务（可选，默认自动检测邮件配置）
+        _no_auto_notify: 内部参数，是否禁用自动创建 notifier（用于批量分析场景）
         
     Returns:
         分析结果对象
     """
     if config is None:
         config = get_config()
+    
+    # 如果未显式传入notifier且不禁用自动创建，则检测邮件配置
+    if notifier is None and not _no_auto_notify:
+        notifier = _get_default_notifier()
     
     # 创建分析流水线
     pipeline = StockAnalysisPipeline(
@@ -82,7 +100,7 @@ def analyze_stocks(
         stock_codes: 股票代码列表
         config: 配置对象（可选，默认使用单例）
         full_report: 是否生成完整报告
-        notifier: 通知服务（可选）
+        notifier: 通知服务（可选，默认自动检测邮件配置）
         merge_notification: 是否合并通知为一封邮件（默认 True）
         
     Returns:
@@ -91,6 +109,10 @@ def analyze_stocks(
     if config is None:
         config = get_config()
     
+    # 如果未显式传入notifier，自动检测邮件配置
+    if notifier is None:
+        notifier = _get_default_notifier()
+    
     report_type = ReportType.FULL if full_report else ReportType.SIMPLE
     results = []
     
@@ -98,7 +120,8 @@ def analyze_stocks(
     for stock_code in stock_codes:
         result = analyze_stock(
             stock_code, config, full_report,
-            notifier=None if merge_notification else notifier
+            notifier=None,
+            _no_auto_notify=True  # 禁用自动创建 notifier
         )
         if result:
             results.append(result)
@@ -126,13 +149,17 @@ def perform_market_review(
     
     Args:
         config: 配置对象（可选，默认使用单例）
-        notifier: 通知服务（可选）
+        notifier: 通知服务（可选，默认自动检测邮件配置）
         
     Returns:
         复盘报告内容
     """
     if config is None:
         config = get_config()
+    
+    # 如果未显式传入notifier，自动检测邮件配置
+    if notifier is None:
+        notifier = _get_default_notifier()
     
     # 创建分析流水线以获取analyzer和search_service
     pipeline = StockAnalysisPipeline(

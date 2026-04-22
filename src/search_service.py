@@ -11,7 +11,9 @@ A股自选股智能分析系统 - 搜索服务模块
 4. 搜索结果缓存和格式化
 """
 
+import json
 import logging
+import os
 import re
 import threading
 import time
@@ -142,13 +144,79 @@ class SearchResponse:
         return "\n".join(lines)
 
 
+class KeyBlacklist:
+    """API Key 配额耗尽黑名单（持久化到 JSON 文件）"""
+
+    def __init__(self, path: str = "data/key_blacklist.json"):
+        self._path = path
+        self._lock = threading.Lock()
+        self._blacklist: Dict[str, dict] = {}
+        self._load()
+
+    def is_exhausted(self, key: str) -> bool:
+        """检查 Key 是否在黑名单且未过期"""
+        prefix = key[:16]
+        with self._lock:
+            entry = self._blacklist.get(prefix)
+            if not entry:
+                return False
+            if datetime.fromisoformat(entry["expires_at"]) <= datetime.now():
+                del self._blacklist[prefix]
+                self._save()
+                return False
+            return True
+
+    def mark_exhausted(self, key: str):
+        """将 Key 标记为配额耗尽，过期时间为下月1号"""
+        prefix = key[:16]
+        now = datetime.now()
+        if now.month == 12:
+            expires = datetime(now.year + 1, 1, 1)
+        else:
+            expires = datetime(now.year, now.month + 1, 1)
+        with self._lock:
+            self._blacklist[prefix] = {
+                "exhausted_at": now.isoformat(),
+                "expires_at": expires.isoformat()
+            }
+            self._save()
+        logger.info(f"[KeyBlacklist] Key {prefix}... 已标记为配额耗尽，将于 {expires.isoformat()} 恢复")
+
+    def _load(self):
+        """从文件加载黑名单"""
+        try:
+            if os.path.exists(self._path):
+                with open(self._path, 'r') as f:
+                    data = json.load(f)
+                # 清除已过期条目
+                now = datetime.now()
+                self._blacklist = {
+                    k: v for k, v in data.items()
+                    if datetime.fromisoformat(v["expires_at"]) > now
+                }
+                if len(self._blacklist) != len(data):
+                    self._save()  # 清理后回写
+        except Exception as e:
+            logger.warning(f"[KeyBlacklist] 加载黑名单失败: {e}")
+            self._blacklist = {}
+
+    def _save(self):
+        """保存黑名单到文件"""
+        try:
+            os.makedirs(os.path.dirname(self._path) or '.', exist_ok=True)
+            with open(self._path, 'w') as f:
+                json.dump(self._blacklist, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"[KeyBlacklist] 保存黑名单失败: {e}")
+
+
 class BaseSearchProvider(ABC):
     """搜索引擎基类"""
-    
+
     def __init__(self, api_keys: List[str], name: str):
         """
         初始化搜索引擎
-        
+
         Args:
             api_keys: API Key 列表（支持多个 key 负载均衡）
             name: 搜索引擎名称
@@ -159,6 +227,10 @@ class BaseSearchProvider(ABC):
         self._key_usage: Dict[str, int] = {key: 0 for key in api_keys}
         self._key_errors: Dict[str, int] = {key: 0 for key in api_keys}
         self._state_lock = threading.RLock()
+        # 共享的 KeyBlacklist 实例（类级别单例）
+        if not hasattr(BaseSearchProvider, '_shared_blacklist'):
+            BaseSearchProvider._shared_blacklist = KeyBlacklist()
+        self._blacklist = BaseSearchProvider._shared_blacklist
     
     @property
     def name(self) -> str:
@@ -172,24 +244,31 @@ class BaseSearchProvider(ABC):
     def _get_next_key(self) -> Optional[str]:
         """
         获取下一个可用的 API Key（负载均衡）
-        
-        策略：轮询 + 跳过错误过多的 key
+
+        策略：轮询 + 跳过黑名单 key + 跳过错误过多的 key
         """
         with self._state_lock:
             if not self._key_cycle:
                 return None
-            
+
             # 最多尝试所有 key
             for _ in range(len(self._api_keys)):
                 key = next(self._key_cycle)
+                # 跳过黑名单中的 Key（配额已耗尽）
+                if self._blacklist.is_exhausted(key):
+                    continue
                 # 跳过错误次数过多的 key（超过 3 次）
                 if self._key_errors.get(key, 0) < 3:
                     return key
-            
-            # 所有 key 都有问题，重置错误计数并返回第一个
-            logger.warning(f"[{self._name}] 所有 API Key 都有错误记录，重置错误计数")
+
+            # 所有 key 都有问题，重置临时错误计数（但不重置黑名单）
+            logger.warning(f"[{self._name}] 所有 API Key 都不可用，重置临时错误计数")
             self._key_errors = {key: 0 for key in self._api_keys}
-            return self._api_keys[0] if self._api_keys else None
+            # 返回第一个不在黑名单中的 key
+            for key in self._api_keys:
+                if not self._blacklist.is_exhausted(key):
+                    return key
+            return None  # 全部在黑名单中
     
     def _record_success(self, key: str) -> None:
         """记录成功使用"""
@@ -205,6 +284,21 @@ class BaseSearchProvider(ABC):
             self._key_errors[key] = self._key_errors.get(key, 0) + 1
             error_count = self._key_errors[key]
         logger.warning(f"[{self._name}] API Key {key[:8]}... 错误计数: {error_count}")
+
+    @staticmethod
+    def _is_quota_exhausted(error_msg: str) -> bool:
+        """检查错误是否为配额耗尽（永久性故障）"""
+        if not error_msg:
+            return False
+        msg_lower = error_msg.lower()
+        return (
+            '[quota_exhausted]' in msg_lower
+            or '432' in error_msg
+            or 'exceeds your plan' in msg_lower
+            or 'usage limit' in msg_lower
+            or 'rate limit' in msg_lower
+            or 'quota' in msg_lower
+        )
     
     @abstractmethod
     def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
@@ -220,42 +314,78 @@ class BaseSearchProvider(ABC):
         api_key: Optional[str] = None,
         **search_kwargs: Any,
     ) -> SearchResponse:
-        """Run the shared search flow with an optional preselected API key."""
-        api_key = api_key or self._get_next_key()
-        if not api_key:
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self._name,
-                success=False,
-                error_message=f"{self._name} 未配置 API Key"
-            )
+        """Run the shared search flow with automatic key failover on quota exhaustion."""
+        max_attempts = 1 if api_key else len(self._api_keys)
+        last_response = None
 
-        start_time = time.time()
-        try:
-            response = self._do_search(query, api_key, max_results, days=days, **search_kwargs)
-            response.search_time = time.time() - start_time
+        for attempt in range(max_attempts):
+            current_key = api_key if api_key else self._get_next_key()
+            if not current_key:
+                break
 
-            if response.success:
-                self._record_success(api_key)
-                logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
-            else:
-                self._record_error(api_key)
+            start_time = time.time()
+            try:
+                response = self._do_search(query, current_key, max_results, days=days, **search_kwargs)
+                response.search_time = time.time() - start_time
 
-            return response
+                if response.success:
+                    self._record_success(current_key)
+                    logger.info(
+                        f"[{self._name}] 搜索 '{query[:30]}' 成功, "
+                        f"共 {len(response.results)} 条结果, "
+                        f"耗时 {response.search_time:.2f}s"
+                    )
+                    return response
+                else:
+                    self._record_error(current_key)
+                    last_response = response
+                    # 配额耗尽：标记黑名单 + 立即重试下一个 Key
+                    if self._is_quota_exhausted(response.error_message or ''):
+                        self._blacklist.mark_exhausted(current_key)
+                        self._key_errors[current_key] = 3  # 立即跳过
+                        logger.warning(
+                            f"[{self._name}] Key {current_key[:8]}... 配额耗尽，"
+                            f"尝试下一个 Key (attempt {attempt + 1}/{max_attempts})"
+                        )
+                        continue  # 重试下一个 Key
 
-        except Exception as e:
-            self._record_error(api_key)
-            elapsed = time.time() - start_time
-            logger.error(f"[{self._name}] 搜索 '{query}' 失败: {e}")
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self._name,
-                success=False,
-                error_message=str(e),
-                search_time=elapsed
-            )
+                    # 临时错误不重试，直接返回
+                    return response
+            except Exception as e:
+                elapsed = time.time() - start_time
+                self._record_error(current_key)
+                error_msg = str(e)
+                last_response = SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self._name,
+                    success=False,
+                    error_message=error_msg,
+                    search_time=elapsed,
+                )
+                # 配额耗尽异常也触发重试
+                if self._is_quota_exhausted(error_msg):
+                    self._blacklist.mark_exhausted(current_key)
+                    self._key_errors[current_key] = 3
+                    logger.warning(
+                        f"[{self._name}] Key {current_key[:8]}... 配额耗尽(异常)，"
+                        f"尝试下一个 Key (attempt {attempt + 1}/{max_attempts})"
+                    )
+                    continue
+
+                logger.error(f"[{self._name}] 搜索异常: {e}, 耗时 {elapsed:.2f}s")
+                return last_response
+
+        # 所有 Key 都失败
+        if last_response:
+            return last_response
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider=self._name,
+            success=False,
+            error_message=f"{self._name} 无可用 API Key",
+        )
 
     def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
         """
@@ -324,6 +454,7 @@ class TavilySearchProvider(BaseSearchProvider):
 
             response = client.search(
                 **search_kwargs,
+                timeout=15,  # 15秒超时，避免默认60秒阻塞分析流程
             )
             
             # 记录原始响应到日志
@@ -350,9 +481,23 @@ class TavilySearchProvider(BaseSearchProvider):
             
         except Exception as e:
             error_msg = str(e)
-            # 检查是否是配额问题
-            if 'rate limit' in error_msg.lower() or 'quota' in error_msg.lower():
-                error_msg = f"API 配额已用尽: {error_msg}"
+            # 精确识别 HTTP 432 配额耗尽
+            is_quota = False
+            if hasattr(e, 'status_code'):
+                is_quota = (e.status_code == 432)
+            elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
+                is_quota = (e.response.status_code == 432)
+            if not is_quota:
+                msg_lower = error_msg.lower()
+                is_quota = (
+                    '432' in error_msg
+                    or 'exceeds your plan' in msg_lower
+                    or 'usage limit' in msg_lower
+                    or 'rate limit' in msg_lower
+                    or 'quota' in msg_lower
+                )
+            if is_quota:
+                error_msg = f"[QUOTA_EXHAUSTED] {error_msg}"
             
             return SearchResponse(
                 query=query,

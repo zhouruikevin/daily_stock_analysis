@@ -908,7 +908,7 @@ class GeminiAnalyzer:
             "latest_news": "【最新消息】近期重要新闻摘要",
             "risk_alerts": ["风险点1：具体描述", "风险点2：具体描述"],
             "positive_catalysts": ["利好1：具体描述", "利好2：具体描述"],
-            "earnings_outlook": "业绩预期分析（基于年报预告、业绩快报等）",
+            "earnings_outlook": "基于财报数据的业绩预期分析（优先使用Tushare财报数据，搜索结果中SerpAPI业绩预期可能为空）",
             "sentiment_summary": "舆情情绪一句话总结"
         },
 
@@ -1058,7 +1058,7 @@ class GeminiAnalyzer:
             "latest_news": "【最新消息】近期重要新闻摘要",
             "risk_alerts": ["风险点1：具体描述", "风险点2：具体描述"],
             "positive_catalysts": ["利好1：具体描述", "利好2：具体描述"],
-            "earnings_outlook": "业绩预期分析（基于年报预告、业绩快报等）",
+            "earnings_outlook": "基于财报数据的业绩预期分析（优先使用Tushare财报数据，搜索结果中SerpAPI业绩预期可能为空）",
             "sentiment_summary": "舆情情绪一句话总结"
         },
 
@@ -1939,7 +1939,9 @@ class GeminiAnalyzer:
             if isinstance(earnings_data, dict)
             else {}
         )
-        if isinstance(financial_report, dict) or isinstance(dividend_metrics, dict):
+        forecast_summary = earnings_data.get("forecast_summary", "N/A")
+        quick_report_summary = earnings_data.get("quick_report_summary", "N/A")
+        if isinstance(financial_report, dict) or isinstance(dividend_metrics, dict) or forecast_summary != "N/A" or quick_report_summary != "N/A":
             financial_report = financial_report if isinstance(financial_report, dict) else {}
             dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
             ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
@@ -1959,7 +1961,20 @@ class GeminiAnalyzer:
 | TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
 | TTM 分红事件数 | {ttm_count} | |
 
-> 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。
+> 若上述字段为 N/A 或缺失，请明确写"数据缺失，无法判断"，禁止编造。
+"""
+        # Add earnings forecast and quick report data from Tushare
+        if forecast_summary != "N/A" or quick_report_summary != "N/A":
+            prompt += f"""
+### 业绩预期（基于 Tushare 财报数据）
+| 指标 | 内容 |
+|------|------|
+| 业绩预告 | {forecast_summary} |
+| 业绩快报 | {quick_report_summary} |
+
+> 若上述字段为 N/A，表示暂无业绩预告或快报数据。
+
+**重要**：`earnings_outlook` 字段必须优先使用上方 Tushare 财报数据，不要仅依赖搜索结果。若上方表格中业绩预告有值，必须将其写入 `earnings_outlook`；若搜索结果中"业绩预期"为空但 Tushare 数据有值，仍应使用 Tushare 数据。
 """
 
         # 添加筹码分布数据

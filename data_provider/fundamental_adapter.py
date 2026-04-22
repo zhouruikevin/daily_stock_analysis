@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-AkShare fundamental adapter (fail-open).
+Fundamental adapters (fail-open).
 
-This adapter intentionally uses capability probing against multiple AkShare
-endpoint candidates. It should never raise to caller; partial data is allowed.
+AkshareFundamentalAdapter: AkShare-based adapter (legacy, unreliable for earnings).
+TushareFundamentalAdapter: Tushare Pro-based adapter (preferred for earnings/forecast).
+
+Both adapters intentionally use capability probing and should never raise to
+caller; partial data is allowed.
 """
 
 from __future__ import annotations
@@ -259,6 +262,385 @@ def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series
 
     # Fallback: use latest row
     return df.iloc[0]
+
+
+def _to_tushare_ts_code(stock_code: str) -> str:
+    """Convert a plain A-share code (e.g. '603444') to Tushare ts_code format (e.g. '603444.SH')."""
+    code = re.sub(r"^(SH|SZ|BJ)", "", _safe_str(stock_code).upper().split(".")[0])
+    if not code or len(code) != 6:
+        return code
+    if code.startswith(('6', '9', '5')):
+        return f"{code}.SH"
+    if code.startswith(('0', '3', '2')):
+        return f"{code}.SZ"
+    if code.startswith(('4', '8')):
+        return f"{code}.BJ"
+    return code
+
+
+def _format_wan_to_yi(value: Any) -> Optional[float]:
+    """Convert Tushare's 万元 unit to 亿元 for readability."""
+    v = _safe_float(value)
+    if v is None:
+        return None
+    return round(v / 10000.0, 4)
+
+
+class TushareFundamentalAdapter:
+    """Tushare Pro adapter for earnings forecast, financial indicators and dividends.
+
+    Preferred over AkShare for these data points because Tushare provides
+    structured, reliable financial data via its Pro API.
+    """
+
+    def __init__(self) -> None:
+        self._api = None
+        self._init_api()
+
+    def _init_api(self) -> None:
+        """Lazy-initialize the Tushare Pro API client."""
+        try:
+            from src.config import get_config
+            config = get_config()
+            token = getattr(config, 'tushare_token', None)
+            if not token:
+                logger.debug("[TushareFundamental] No TUSHARE_TOKEN configured, adapter disabled")
+                return
+            api_url = getattr(config, 'tushare_api_url', None)
+            if api_url:
+                try:
+                    import tushare as ts
+                    pro = ts.pro_api(token)
+                    pro._DataApi__http_url = api_url
+                    self._api = pro
+                    logger.debug(f"[TushareFundamental] Initialized with official SDK ({api_url})")
+                except ImportError:
+                    from data_provider.tushare_fetcher import _TushareHttpClient
+                    self._api = _TushareHttpClient(token=token, api_url=api_url)
+                    logger.debug(f"[TushareFundamental] Initialized with HTTP client ({api_url})")
+            else:
+                from data_provider.tushare_fetcher import _TushareHttpClient
+                self._api = _TushareHttpClient(token=token)
+                logger.debug("[TushareFundamental] Initialized with HTTP client")
+        except Exception as e:
+            logger.warning(f"[TushareFundamental] Init failed: {e}")
+            self._api = None
+
+    @property
+    def is_available(self) -> bool:
+        return self._api is not None
+
+    def _call_api(self, api_name: str, **kwargs) -> Optional[pd.DataFrame]:
+        """Call a Tushare Pro API method, returning DataFrame or None on failure."""
+        if self._api is None:
+            return None
+        try:
+            method = getattr(self._api, api_name)
+            df = method(**kwargs)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception as exc:
+            logger.debug(f"[TushareFundamental] {api_name} failed: {type(exc).__name__}: {exc}")
+        return None
+
+    def get_earnings_forecast(self, stock_code: str) -> Dict[str, Any]:
+        """Fetch earnings forecast (业绩预告) from Tushare forecast API."""
+        result: Dict[str, Any] = {
+            "forecast_summary": None,
+            "forecast_type": None,
+            "forecast_change_min": None,
+            "forecast_change_max": None,
+            "ann_date": None,
+            "end_date": None,
+            "source": None,
+            "errors": [],
+        }
+        ts_code = _to_tushare_ts_code(stock_code)
+        if not ts_code or '.' not in ts_code:
+            result["errors"].append("invalid_stock_code")
+            return result
+
+        df = self._call_api(
+            "forecast",
+            ts_code=ts_code,
+            fields="ts_code,ann_date,end_date,type,p_change_min,p_change_max,summary",
+        )
+        if df is None:
+            result["errors"].append("forecast_api_failed")
+            return result
+
+        # Sort by ann_date descending, take the latest
+        try:
+            df = df.sort_values("ann_date", ascending=False)
+        except Exception:
+            pass
+
+        row = df.iloc[0]
+        summary = _safe_str(row.get("summary"))
+        ftype = _safe_str(row.get("type"))
+        p_min = _safe_float(row.get("p_change_min"))
+        p_max = _safe_float(row.get("p_change_max"))
+        ann_date = _safe_str(row.get("ann_date"))
+        end_date = _safe_str(row.get("end_date"))
+
+        result["forecast_summary"] = summary[:200] if summary else None
+        result["forecast_type"] = ftype if ftype else None
+        result["forecast_change_min"] = p_min
+        result["forecast_change_max"] = p_max
+        result["ann_date"] = ann_date
+        result["end_date"] = end_date
+        result["source"] = "tushare_forecast"
+
+        # Build a human-readable forecast summary if raw summary is sparse
+        if not result["forecast_summary"]:
+            parts = []
+            if ftype:
+                type_map = {
+                    "预增": "预计业绩增长",
+                    "预减": "预计业绩下降",
+                    "预亏": "预计亏损",
+                    "预盈": "预计扭亏为盈",
+                    "扭亏": "预计扭亏为盈",
+                    "首亏": "预计首次亏损",
+                    "续盈": "预计继续盈利",
+                    "续亏": "预计继续亏损",
+                    "增亏": "预计亏损增加",
+                    "减亏": "预计亏损减少",
+                }
+                parts.append(type_map.get(ftype, f"预计{ftype}"))
+            if p_min is not None or p_max is not None:
+                if p_min is not None and p_max is not None:
+                    if p_min == p_max:
+                        parts.append(f"净利润同比变动{p_min:+.0f}%")
+                    else:
+                        parts.append(f"净利润同比变动{p_min:+.0f}%~{p_max:+.0f}%")
+                elif p_min is not None:
+                    parts.append(f"净利润同比变动{p_min:+.0f}%")
+            if end_date:
+                parts.append(f"报告期{end_date}")
+            if parts:
+                result["forecast_summary"] = ", ".join(parts)
+
+        return result
+
+    def get_financial_indicator(self, stock_code: str) -> Dict[str, Any]:
+        """Fetch financial indicators (财务指标) from Tushare fina_indicator API."""
+        result: Dict[str, Any] = {
+            "revenue_yoy": None,
+            "profit_dedt_yoy": None,
+            "roe": None,
+            "grossprofit_margin": None,
+            "netprofit_margin": None,
+            "report_date": None,
+            "ann_date": None,
+            "source": None,
+            "errors": [],
+        }
+        ts_code = _to_tushare_ts_code(stock_code)
+        if not ts_code or '.' not in ts_code:
+            result["errors"].append("invalid_stock_code")
+            return result
+
+        df = self._call_api(
+            "fina_indicator",
+            ts_code=ts_code,
+            fields="ts_code,ann_date,end_date,roe,roe_dt,grossprofit_margin,netprofit_margin,revenue_yoy,profit_dedt_yoy",
+        )
+        if df is None:
+            result["errors"].append("fina_indicator_api_failed")
+            return result
+
+        # Sort by ann_date descending, take the latest
+        try:
+            df = df.sort_values("ann_date", ascending=False)
+        except Exception:
+            pass
+
+        row = df.iloc[0]
+        result["revenue_yoy"] = _safe_float(row.get("revenue_yoy"))
+        result["profit_dedt_yoy"] = _safe_float(row.get("profit_dedt_yoy"))
+        result["roe"] = _safe_float(row.get("roe_dt")) or _safe_float(row.get("roe"))
+        result["grossprofit_margin"] = _safe_float(row.get("grossprofit_margin"))
+        result["netprofit_margin"] = _safe_float(row.get("netprofit_margin"))
+        result["report_date"] = _safe_str(row.get("end_date"))
+        result["ann_date"] = _safe_str(row.get("ann_date"))
+        result["source"] = "tushare_fina_indicator"
+        return result
+
+    def get_income_statement(self, stock_code: str) -> Dict[str, Any]:
+        """Fetch income statement (利润表) from Tushare income API."""
+        result: Dict[str, Any] = {
+            "revenue": None,
+            "n_income_parent": None,
+            "operating_cash_flow": None,
+            "revenue_yoy": None,
+            "n_income_yoy": None,
+            "report_date": None,
+            "ann_date": None,
+            "source": None,
+            "errors": [],
+        }
+        ts_code = _to_tushare_ts_code(stock_code)
+        if not ts_code or '.' not in ts_code:
+            result["errors"].append("invalid_stock_code")
+            return result
+
+        df = self._call_api(
+            "income",
+            ts_code=ts_code,
+            fields="ts_code,ann_date,end_date,total_revenue,revenue,n_income_attr_p,n_income_yoy,revenue_yoy,update_flag",
+        )
+        if df is None:
+            result["errors"].append("income_api_failed")
+            return result
+
+        # Sort by ann_date descending, take the latest
+        try:
+            df = df.sort_values("ann_date", ascending=False)
+        except Exception:
+            pass
+
+        row = df.iloc[0]
+        result["revenue"] = _format_wan_to_yi(row.get("revenue")) or _format_wan_to_yi(row.get("total_revenue"))
+        result["n_income_parent"] = _format_wan_to_yi(row.get("n_income_attr_p"))
+        result["revenue_yoy"] = _safe_float(row.get("revenue_yoy"))
+        result["n_income_yoy"] = _safe_float(row.get("n_income_yoy"))
+        result["report_date"] = _safe_str(row.get("end_date"))
+        result["ann_date"] = _safe_str(row.get("ann_date"))
+        result["source"] = "tushare_income"
+        return result
+
+    def get_express(self, stock_code: str) -> Dict[str, Any]:
+        """Fetch earnings express (业绩快报) from Tushare express API."""
+        result: Dict[str, Any] = {
+            "quick_report_summary": None,
+            "revenue": None,
+            "n_income": None,
+            "yoy_net_profit": None,
+            "report_date": None,
+            "ann_date": None,
+            "source": None,
+            "errors": [],
+        }
+        ts_code = _to_tushare_ts_code(stock_code)
+        if not ts_code or '.' not in ts_code:
+            result["errors"].append("invalid_stock_code")
+            return result
+
+        df = self._call_api(
+            "express",
+            ts_code=ts_code,
+            fields="ts_code,ann_date,end_date,revenue,operate_profit,total_profit,n_income,yoy_net_profit,is_audit",
+        )
+        if df is None:
+            result["errors"].append("express_api_failed")
+            return result
+
+        try:
+            df = df.sort_values("ann_date", ascending=False)
+        except Exception:
+            pass
+
+        row = df.iloc[0]
+        revenue = _format_wan_to_yi(row.get("revenue"))
+        n_income = _format_wan_to_yi(row.get("n_income"))
+        yoy_net = _safe_float(row.get("yoy_net_profit"))
+        end_date = _safe_str(row.get("end_date"))
+
+        # Build human-readable summary
+        parts = []
+        if revenue is not None:
+            parts.append(f"营收{revenue:.2f}亿")
+        if n_income is not None:
+            parts.append(f"净利润{n_income:.2f}亿")
+        if yoy_net is not None:
+            parts.append(f"同比{'增长' if yoy_net > 0 else '下降'}{abs(yoy_net):.1f}%")
+        if end_date:
+            parts.append(f"报告期{end_date}")
+
+        result["quick_report_summary"] = ", ".join(parts) if parts else None
+        result["revenue"] = revenue
+        result["n_income"] = n_income
+        result["yoy_net_profit"] = yoy_net
+        result["report_date"] = end_date
+        result["ann_date"] = _safe_str(row.get("ann_date"))
+        result["source"] = "tushare_express"
+        return result
+
+    def get_earnings_bundle(self, stock_code: str) -> Dict[str, Any]:
+        """Aggregate earnings data from Tushare: forecast + financial indicator + income + express.
+
+        Returns a dict compatible with the earnings block in get_fundamental_bundle().
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "earnings": {},
+            "growth": {},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        if not self.is_available:
+            result["errors"].append("tushare_not_available")
+            return result
+
+        # 1. Earnings forecast (业绩预告)
+        forecast = self.get_earnings_forecast(stock_code)
+        result["errors"].extend(forecast.get("errors", []))
+        if forecast.get("forecast_summary"):
+            result["earnings"]["forecast_summary"] = forecast["forecast_summary"]
+            result["earnings"]["forecast_ann_date"] = forecast.get("ann_date")
+            result["earnings"]["forecast_end_date"] = forecast.get("end_date")
+            result["source_chain"].append(f"earnings_forecast:{forecast.get('source', 'tushare')}")
+
+        # 2. Financial indicators (财务指标: ROE, 毛利率, 净利率, 营收同比)
+        fina = self.get_financial_indicator(stock_code)
+        result["errors"].extend(fina.get("errors", []))
+        has_growth = any(v is not None for k, v in fina.items() if k in ("revenue_yoy", "roe", "grossprofit_margin"))
+        if has_growth:
+            result["growth"] = {
+                "revenue_yoy": fina.get("revenue_yoy"),
+                "net_profit_yoy": fina.get("profit_dedt_yoy"),
+                "roe": fina.get("roe"),
+                "gross_margin": fina.get("grossprofit_margin"),
+            }
+            result["source_chain"].append(f"growth:{fina.get('source', 'tushare')}")
+
+        # 3. Income statement (利润表)
+        income = self.get_income_statement(stock_code)
+        result["errors"].extend(income.get("errors", []))
+        has_financial_report = any(v is not None for k, v in income.items() if k in ("revenue", "n_income_parent", "revenue_yoy"))
+        if has_financial_report:
+            financial_report_payload = {
+                "report_date": income.get("report_date"),
+                "revenue": income.get("revenue"),
+                "net_profit_parent": income.get("n_income_parent"),
+                "operating_cash_flow": None,  # Not available in income API
+                "roe": fina.get("roe"),  # Fill from fina_indicator
+                "revenue_yoy": income.get("revenue_yoy"),
+                "n_income_yoy": income.get("n_income_yoy"),
+            }
+            result["earnings"]["financial_report"] = financial_report_payload
+            result["source_chain"].append(f"financial_report:{income.get('source', 'tushare')}")
+
+        # 4. Express (业绩快报)
+        express = self.get_express(stock_code)
+        result["errors"].extend(express.get("errors", []))
+        if express.get("quick_report_summary"):
+            result["earnings"]["quick_report_summary"] = express["quick_report_summary"]
+            result["source_chain"].append(f"earnings_quick:{express.get('source', 'tushare')}")
+
+        # Derive status
+        has_earnings = bool(result["earnings"])
+        has_growth_data = bool(result["growth"])
+        if has_earnings and has_growth_data:
+            result["status"] = "ok"
+        elif has_earnings or has_growth_data:
+            result["status"] = "partial"
+        else:
+            result["status"] = "not_supported"
+
+        return result
 
 
 class AkshareFundamentalAdapter:

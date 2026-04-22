@@ -26,7 +26,7 @@ import pandas as pd
 import numpy as np
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
-from .fundamental_adapter import AkshareFundamentalAdapter
+from .fundamental_adapter import AkshareFundamentalAdapter, TushareFundamentalAdapter
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -504,6 +504,7 @@ class DataFetcherManager:
             # 默认数据源将在首次使用时延迟加载
             self._init_default_fetchers()
         self._fundamental_adapter = AkshareFundamentalAdapter()
+        self._tushare_fundamental_adapter = TushareFundamentalAdapter()
         self._tickflow_fetcher = None
         self._tickflow_api_key: Optional[str] = None
         self._tickflow_lock = RLock()
@@ -2207,7 +2208,36 @@ class DataFetcherManager:
             [valuation_err] if valuation_err else [],
         )
 
-        # growth / earnings / institution (one AkShare call)
+        # growth / earnings / institution (Tushare first, then AkShare fallback)
+        #
+        # Tushare provides reliable earnings/forecast data; prefer it when available.
+        # AkShare serves as fallback and also provides institution/capital_flow/dragon_tiger.
+        tushare_earnings_payload: Dict[str, Any] = {}
+        tushare_growth_payload: Dict[str, Any] = {}
+        tushare_earnings_errors: List[str] = []
+        tushare_chain_entries: List[Dict[str, Any]] = []
+
+        if self._tushare_fundamental_adapter.is_available and remaining_seconds > 0:
+            tushare_timeout = min(fetch_timeout, remaining_seconds)
+            tushare_bundle, tushare_err_msg, tushare_ms = self._run_with_retry(
+                lambda: self._tushare_fundamental_adapter.get_earnings_bundle(stock_code),
+                tushare_timeout,
+                "tushare_earnings_bundle",
+            )
+            _consume_budget(tushare_ms)
+            if isinstance(tushare_bundle, dict):
+                tushare_earnings_payload = tushare_bundle.get("earnings", {}) or {}
+                tushare_growth_payload = tushare_bundle.get("growth", {}) or {}
+                tushare_earnings_errors = tushare_bundle.get("errors", []) or []
+                tushare_chain_entries = tushare_bundle.get("source_chain", []) or []
+                if not isinstance(tushare_earnings_payload, dict):
+                    tushare_earnings_payload = {}
+                if not isinstance(tushare_growth_payload, dict):
+                    tushare_growth_payload = {}
+            else:
+                tushare_earnings_errors = ["tushare_earnings_bundle_failed"]
+
+        # AkShare bundle (fallback for earnings, primary for institution)
         if remaining_seconds <= 0:
             bundle_status = "failed"
             bundle_payload: Dict[str, Any] = {}
@@ -2242,6 +2272,9 @@ class DataFetcherManager:
             bundle_status,
             bundle_ms,
         )
+
+        # Merge Tushare earnings/growth into AkShare bundle results
+        # Tushare data takes priority; AkShare fills gaps where Tushare has no data
         growth_payload = bundle_payload.get("growth", {}) if isinstance(bundle_payload, dict) else {}
         earnings_payload = bundle_payload.get("earnings", {}) if isinstance(bundle_payload, dict) else {}
         institution_payload = bundle_payload.get("institution", {}) if isinstance(bundle_payload, dict) else {}
@@ -2257,6 +2290,39 @@ class DataFetcherManager:
             institution_payload = {}
         else:
             institution_payload = dict(institution_payload)
+
+        # Merge Tushare growth data (Tushare takes priority)
+        if tushare_growth_payload:
+            for key, value in tushare_growth_payload.items():
+                if value is not None:
+                    growth_payload[key] = value
+            # Add Tushare source chain entries
+            for entry in tushare_chain_entries:
+                if isinstance(entry, str) and entry.startswith("growth:"):
+                    bundle_chain.append({"provider": "tushare_fundamental", "result": "ok", "duration_ms": 0})
+                    break
+
+        # Merge Tushare earnings data (Tushare takes priority)
+        if tushare_earnings_payload:
+            for key, value in tushare_earnings_payload.items():
+                # Tushare data takes priority; only fill from AkShare if Tushare has no value
+                if key in ("financial_report",):
+                    # For financial_report, merge at field level
+                    ts_report = value if isinstance(value, dict) else {}
+                    ak_report = earnings_payload.get("financial_report", {}) if isinstance(earnings_payload.get("financial_report"), dict) else {}
+                    merged_report = dict(ak_report)  # start with AkShare
+                    for rk, rv in ts_report.items():
+                        if rv is not None:
+                            merged_report[rk] = rv  # Tushare overrides
+                    if any(v is not None for v in merged_report.values()):
+                        earnings_payload["financial_report"] = merged_report
+                elif value is not None:
+                    earnings_payload[key] = value
+            # Add Tushare source chain entries for earnings
+            for entry in tushare_chain_entries:
+                if isinstance(entry, str) and entry.startswith("earnings_"):
+                    bundle_chain.append({"provider": "tushare_fundamental", "result": "ok", "duration_ms": 0})
+                    break
 
         # Derive TTM dividend yield from already-fetched quote price; avoid extra quote calls.
         earnings_extra_errors: List[str] = []
@@ -2294,6 +2360,8 @@ class DataFetcherManager:
 
         adapter_errors = list(bundle_payload.get("errors", [])) if isinstance(bundle_payload, dict) else []
         adapter_errors.extend(bundle_errors)
+        # Include Tushare errors so they appear in the final error list
+        adapter_errors.extend(tushare_earnings_errors)
         growth_errors = list(adapter_errors)
         earnings_errors = list(adapter_errors)
         earnings_errors.extend(earnings_extra_errors)
