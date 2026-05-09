@@ -237,23 +237,84 @@ class StockAnalysisPipeline:
     
     def analyze_stock(self, code: str, report_type: ReportType, query_id: str) -> Optional[AnalysisResult]:
         """
-        分析单只股票（增强版：含量比、换手率、筹码分析、多维度情报）
-        
-        流程：
-        1. 获取实时行情（量比、换手率）- 通过 DataFetcherManager 自动故障切换
-        2. 获取筹码分布 - 通过 DataFetcherManager 带熔断保护
-        3. 进行趋势分析（基于交易理念）
-        4. 多维度情报搜索（最新消息+风险排查+业绩预期）
-        5. 从数据库获取分析上下文
-        6. 调用 AI 进行综合分析
-        
+        分析单只股票,带200秒整体超时保护
+            
+        任何环节(搜索、LLM、数据源)卡死都不会阻塞整个worker线程。
+        超时后返回失败结果,确保批量分析任务继续执行。
+            
         Args:
             query_id: 查询链路关联 id
             code: 股票代码
             report_type: 报告类型
-            
+                
         Returns:
-            AnalysisResult 或 None（如果分析失败）
+            AnalysisResult 或失败结果(不会返回None导致统计缺失)
+        """
+        import threading
+            
+        stock_name = code
+        result_container = {"result": None, "exception": None}
+            
+        def _analyze_target():
+            """在线程中执行实际分析"""
+            try:
+                result_container["result"] = self._analyze_stock_impl(
+                    code, report_type, query_id
+                )
+            except Exception as e:
+                result_container["exception"] = e
+            
+        # 启动daemon线程执行分析
+        analysis_thread = threading.Thread(target=_analyze_target, daemon=True)
+        analysis_thread.start()
+        analysis_thread.join(timeout=200)  # 单股整体分析超时200秒
+            
+        # 检查超时
+        if analysis_thread.is_alive():
+            logger.error(f"[{code}] 分析超时(200s),强制跳过继续下一只股票")
+            return AnalysisResult(
+                code=code,
+                name=stock_name,
+                success=False,
+                error_message="分析超时(200秒),已跳过",
+                sentiment_score=0,
+                trend_prediction="震荡",
+                operation_advice="观望",
+            )
+            
+        # 检查异常
+        if result_container["exception"]:
+            exc = result_container["exception"]
+            logger.error(f"[{code}] 分析异常: {exc}", exc_info=True)
+            return AnalysisResult(
+                code=code,
+                name=stock_name,
+                success=False,
+                error_message=f"分析异常: {str(exc)[:200]}",
+                sentiment_score=0,
+            )
+            
+        return result_container["result"]
+        
+    def _analyze_stock_impl(self, code: str, report_type: ReportType, query_id: str) -> Optional[AnalysisResult]:
+        """
+        分析单只股票的实际实现(不含超时包装)
+            
+        流程:
+        1. 获取实时行情(量比、换手率) - 通过 DataFetcherManager 自动故障切换
+        2. 获取筹码分布 - 通过 DataFetcherManager 带熔断保护
+        3. 进行趋势分析(基于交易理念)
+        4. 多维度情报搜索(最新消息+风险排查+业绩预期)
+        5. 从数据库获取分析上下文
+        6. 调用 AI 进行综合分析
+            
+        Args:
+            query_id: 查询链路关联 id
+            code: 股票代码
+            report_type: 报告类型
+                
+        Returns:
+            AnalysisResult 或 None(如果分析失败)
         """
         stock_name = code
         try:
@@ -378,18 +439,37 @@ class StockAnalysisPipeline:
                     trend_result,
                 )
 
-            # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
+            # Step 4: 多维度情报搜索(最新消息+风险排查+业绩预期)
             news_context = None
-            self._emit_progress(46, f"{stock_name}：正在检索新闻与舆情")
+            self._emit_progress(46, f"{stock_name}:正在检索新闻与舆情")
             if self.search_service is not None and self.search_service.is_available:
                 logger.info(f"{stock_name}({code}) 开始多维度情报搜索...")
 
-                # 使用多维度搜索（最多5次搜索）
-                intel_results = self.search_service.search_comprehensive_intel(
-                    stock_code=code,
-                    stock_name=stock_name,
-                    max_searches=5
-                )
+                # 使用daemon线程确保超时可靠(修复嵌套ThreadPoolExecutor超时失效问题)
+                intel_container = {"results": None, "exception": None}
+
+                def _do_search():
+                    try:
+                        intel_container["results"] = self.search_service.search_comprehensive_intel(
+                            stock_code=code,
+                            stock_name=stock_name,
+                            max_searches=5
+                        )
+                    except Exception as e:
+                        intel_container["exception"] = e
+
+                search_thread = threading.Thread(target=_do_search, daemon=True)
+                search_thread.start()
+                search_thread.join(timeout=60)  # 搜索整体超时60秒
+
+                if search_thread.is_alive():
+                    logger.warning(f"{stock_name}({code}) 情报搜索超时(60s),跳过搜索继续分析")
+                    intel_results = {}
+                elif intel_container["exception"]:
+                    logger.warning(f"{stock_name}({code}) 情报搜索异常: {intel_container['exception']},跳过搜索继续分析")
+                    intel_results = {}
+                else:
+                    intel_results = intel_container["results"] or {}
 
                 # 格式化情报报告
                 if intel_results:
@@ -1777,7 +1857,16 @@ class StockAnalysisPipeline:
         except Exception as e:
             # 捕获所有异常，确保单股失败不影响整体
             logger.exception(f"[{code}] 处理过程发生未知异常: {e}")
-            return None
+            # 返回失败结果而不是None，便于统计
+            return AnalysisResult(
+                code=code,
+                name=code,
+                success=False,
+                error_message=f"处理异常: {str(e)[:200]}",
+                sentiment_score=0,
+                trend_prediction="震荡",
+                operation_advice="观望",
+            )
         finally:
             reset_frozen_target_date(token)
     
@@ -1879,10 +1968,15 @@ class StockAnalysisPipeline:
             }
             
             # 收集结果
+            completed_count = 0
+            failed_count = 0
+            
             for idx, future in enumerate(as_completed(future_to_code)):
                 code = future_to_code[future]
                 try:
                     result = future.result()
+                    completed_count += 1
+                    
                     if result and result.success:
                         results.append(result)
                         if single_stock_notify and send_notification and not dry_run:
@@ -1892,8 +1986,9 @@ class StockAnalysisPipeline:
                                 fallback_code=code,
                             )
                     elif result and not result.success:
+                        failed_count += 1
                         logger.warning(
-                            f"[{code}] 分析结果标记为失败，不计入汇总: "
+                            f"[{code}] 分析失败(已隔离,不影响其他股票): "
                             f"{result.error_message or '未知原因'}"
                         )
 
@@ -1907,7 +2002,13 @@ class StockAnalysisPipeline:
                         time.sleep(analysis_delay)
 
                 except Exception as e:
-                    logger.error(f"[{code}] 任务执行失败: {e}")
+                    failed_count += 1
+                    logger.error(f"[{code}] 任务执行异常(已隔离): {e}", exc_info=True)
+            
+            logger.info(
+                f"批量分析完成: 总{len(stock_codes)}只, "
+                f"成功{len(results)}只, 失败{failed_count}只"
+            )
         
         # 统计
         elapsed_time = time.time() - start_time
