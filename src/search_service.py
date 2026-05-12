@@ -6,7 +6,7 @@ A股自选股智能分析系统 - 搜索服务模块
 
 职责：
 1. 提供统一的新闻搜索接口
-2. 支持 Bocha、Tavily、Brave、SerpAPI、SearXNG 多种搜索引擎
+2. 支持 Bocha、Tavily、Brave、SerpAPI、百炼、SearXNG 多种搜索引擎
 3. 多 Key 负载均衡和故障转移
 4. 搜索结果缓存和格式化
 """
@@ -1391,28 +1391,29 @@ class AnspireSearchProvider(BaseSearchProvider):
             return '未知来源'
 
 
-class MiniMaxSearchProvider(BaseSearchProvider):
+class BailianSearchProvider(BaseSearchProvider):
     """
-    MiniMax Web Search (Coding Plan API)
+    百炼 (Bailian / DashScope) Web Search Provider
 
     Features:
-    - Backed by MiniMax Coding Plan subscription
-    - Returns structured organic results with title/link/snippet/date
-    - No native time-range parameter; time filtering is done via query
-      augmentation and client-side date filtering
+    - Uses Alibaba Cloud DashScope compatible-mode API with enable_search
+    - Returns structured search results with title/url/snippet/date
     - Circuit-breaker protection: 3 consecutive failures -> 300s cooldown
+    - Multi-key rotation and load balancing
 
-    API endpoint: POST https://api.minimaxi.com/v1/coding_plan/search
+    API endpoint: POST https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
     """
 
-    API_ENDPOINT = "https://api.minimaxi.com/v1/coding_plan/search"
+    API_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    # Use a lightweight model for search to minimize cost and latency
+    DEFAULT_MODEL = "qwen-plus"
 
     # Circuit-breaker settings
     _CB_FAILURE_THRESHOLD = 3
     _CB_COOLDOWN_SECONDS = 300  # 5 minutes
 
     def __init__(self, api_keys: List[str]):
-        super().__init__(api_keys, "MiniMax")
+        super().__init__(api_keys, "Bailian")
         # Circuit breaker state
         self._consecutive_failures = 0
         self._circuit_open_until: float = 0.0
@@ -1444,7 +1445,7 @@ class MiniMaxSearchProvider(BaseSearchProvider):
             if self._consecutive_failures >= self._CB_FAILURE_THRESHOLD:
                 self._circuit_open_until = time.time() + self._CB_COOLDOWN_SECONDS
                 warning_message = (
-                    f"[MiniMax] Circuit breaker OPEN – "
+                    f"[Bailian] Circuit breaker OPEN – "
                     f"{self._consecutive_failures} consecutive failures, "
                     f"cooldown {self._CB_COOLDOWN_SECONDS}s"
                 )
@@ -1490,7 +1491,6 @@ class MiniMaxSearchProvider(BaseSearchProvider):
         try:
             from dateutil import parser as dateutil_parser
             dt = dateutil_parser.parse(date_str, fuzzy=True)
-            from datetime import timedelta, timezone
             now = datetime.now(timezone.utc) if dt.tzinfo else datetime.now()
             return (now - dt) <= timedelta(days=days + 1)  # +1 buffer
         except Exception:
@@ -1499,7 +1499,7 @@ class MiniMaxSearchProvider(BaseSearchProvider):
     # ------------------------------------------------------------------
 
     def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
-        """Execute MiniMax web search."""
+        """Execute Bailian (DashScope) web search via enable_search."""
         try:
             # Detect language hint from query (simple heuristic)
             has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in query)
@@ -1509,18 +1509,31 @@ class MiniMaxSearchProvider(BaseSearchProvider):
             headers = {
                 'Authorization': f'Bearer {api_key}',
                 'Content-Type': 'application/json',
-                'MM-API-Source': 'Minimax-MCP',
             }
-            payload = {"q": augmented_query}
+            payload = {
+                "model": self.DEFAULT_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "你是一个搜索助手。请根据用户查询返回相关的新闻和信息。"
+                    },
+                    {
+                        "role": "user",
+                        "content": augmented_query
+                    }
+                ],
+                "enable_search": True,
+                "stream": False,
+            }
 
             response = _post_with_retry(
-                self.API_ENDPOINT, headers=headers, json=payload, timeout=15
+                self.API_ENDPOINT, headers=headers, json=payload, timeout=30
             )
 
             # HTTP error handling
             if response.status_code != 200:
                 error_msg = self._parse_http_error(response)
-                logger.warning(f"[MiniMax] Search failed: {error_msg}")
+                logger.warning(f"[Bailian] Search failed: {error_msg}")
                 return SearchResponse(
                     query=query,
                     results=[],
@@ -1531,10 +1544,9 @@ class MiniMaxSearchProvider(BaseSearchProvider):
 
             data = response.json()
 
-            # Check base_resp status
-            base_resp = data.get('base_resp', {})
-            if base_resp.get('status_code', 0) != 0:
-                error_msg = base_resp.get('status_msg', 'Unknown API error')
+            # Check for API-level errors
+            if 'error' in data:
+                error_msg = data['error'].get('message', 'Unknown API error')
                 return SearchResponse(
                     query=query,
                     results=[],
@@ -1543,30 +1555,89 @@ class MiniMaxSearchProvider(BaseSearchProvider):
                     error_message=error_msg,
                 )
 
-            logger.info(f"[MiniMax] Search done, query='{query}'")
-            logger.debug(f"[MiniMax] Raw response keys: {list(data.keys())}")
+            logger.info(f"[Bailian] Search done, query='{query}'")
+            logger.debug(f"[Bailian] Raw response keys: {list(data.keys())}")
 
-            # Parse organic results
+            # Parse search results from DashScope response
             results: List[SearchResult] = []
-            for item in data.get('organic', []):
-                date_val = item.get('date')
 
-                # Client-side time filtering
-                if not self._is_within_days(date_val, days):
-                    continue
+            # Method 1: Extract from top-level 'search_results' (DashScope format)
+            search_results_raw = data.get('search_results') or []
+            if search_results_raw:
+                # DashScope may wrap results in a list of search-type objects
+                for sr_group in search_results_raw:
+                    if isinstance(sr_group, dict):
+                        items = sr_group.get('search_results', [sr_group])
+                    elif isinstance(sr_group, list):
+                        items = sr_group
+                    else:
+                        continue
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        date_val = item.get('date') or item.get('published_date') or None
+                        if not self._is_within_days(date_val, days):
+                            continue
+                        url = item.get('url') or item.get('link') or ''
+                        title = item.get('title') or ''
+                        snippet = (item.get('snippet') or item.get('content') or '')[:500]
+                        if url or title:
+                            results.append(SearchResult(
+                                title=title,
+                                snippet=snippet,
+                                url=url,
+                                source=item.get('site_name') or self._extract_domain(url),
+                                published_date=date_val,
+                            ))
+                        if len(results) >= max_results:
+                            break
+                    if len(results) >= max_results:
+                        break
 
-                results.append(SearchResult(
-                    title=item.get('title', ''),
-                    snippet=(item.get('snippet', '') or '')[:500],
-                    url=item.get('link', ''),
-                    source=self._extract_domain(item.get('link', '')),
-                    published_date=date_val,
-                ))
+            # Method 2: Extract from choices[0].message citations/annotations
+            if not results:
+                choices = data.get('choices', [])
+                if choices:
+                    message = choices[0].get('message', {})
+                    # Check for web_search_results in message metadata
+                    annotations = message.get('annotations') or message.get('tool_calls') or []
+                    for ann in annotations:
+                        if isinstance(ann, dict):
+                            ann_type = ann.get('type', '')
+                            if ann_type == 'url_citation' or 'url' in ann:
+                                url = ann.get('url') or ''
+                                title = ann.get('title') or ''
+                                snippet = (ann.get('snippet') or ann.get('text') or '')[:500]
+                                date_val = ann.get('date') or ann.get('published_date') or None
+                                if not self._is_within_days(date_val, days):
+                                    continue
+                                if url or title:
+                                    results.append(SearchResult(
+                                        title=title,
+                                        snippet=snippet,
+                                        url=url,
+                                        source=ann.get('site_name') or self._extract_domain(url),
+                                        published_date=date_val,
+                                    ))
+                                if len(results) >= max_results:
+                                    break
 
-                if len(results) >= max_results:
-                    break
+            # Method 3: Fallback - parse content text for references if no structured results
+            if not results:
+                choices = data.get('choices', [])
+                if choices:
+                    content = choices[0].get('message', {}).get('content', '')
+                    if content:
+                        # Create a single result from the synthesized content
+                        results.append(SearchResult(
+                            title=query,
+                            snippet=content[:500],
+                            url='',
+                            source='百炼搜索',
+                            published_date=None,
+                        ))
 
-            logger.info(f"[MiniMax] Parsed {len(results)} results (after time filter)")
+            logger.info(f"[Bailian] Parsed {len(results)} results (after time filter)")
 
             return SearchResponse(
                 query=query,
@@ -1577,21 +1648,21 @@ class MiniMaxSearchProvider(BaseSearchProvider):
 
         except requests.exceptions.Timeout:
             error_msg = "Request timeout"
-            logger.error(f"[MiniMax] {error_msg}")
+            logger.error(f"[Bailian] {error_msg}")
             return SearchResponse(
                 query=query, results=[], provider=self.name,
                 success=False, error_message=error_msg,
             )
         except requests.exceptions.RequestException as e:
             error_msg = f"Network error: {e}"
-            logger.error(f"[MiniMax] {error_msg}")
+            logger.error(f"[Bailian] {error_msg}")
             return SearchResponse(
                 query=query, results=[], provider=self.name,
                 success=False, error_message=error_msg,
             )
         except Exception as e:
             error_msg = f"Unexpected error: {e}"
-            logger.error(f"[MiniMax] {error_msg}")
+            logger.error(f"[Bailian] {error_msg}")
             return SearchResponse(
                 query=query, results=[], provider=self.name,
                 success=False, error_message=error_msg,
@@ -1599,13 +1670,13 @@ class MiniMaxSearchProvider(BaseSearchProvider):
 
     @staticmethod
     def _parse_http_error(response) -> str:
-        """Parse HTTP error response from MiniMax API."""
+        """Parse HTTP error response from Bailian API."""
         try:
             ct = response.headers.get('content-type', '')
             if 'json' in ct:
                 err = response.json()
-                base_resp = err.get('base_resp', {})
-                msg = base_resp.get('status_msg') or err.get('message') or str(err)
+                error_obj = err.get('error', {})
+                msg = error_obj.get('message') or err.get('message') or str(err)
                 return msg
             return response.text[:200]
         except Exception:
@@ -2269,7 +2340,7 @@ class SearchService:
         anspire_keys: Optional[List[str]] = None,
         brave_keys: Optional[List[str]] = None,
         serpapi_keys: Optional[List[str]] = None,
-        minimax_keys: Optional[List[str]] = None,
+        bailian_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = True,
         news_max_age_days: int = 3,
@@ -2284,7 +2355,7 @@ class SearchService:
             anspire_keys: Anspire Search API Key 列表
             brave_keys: Brave Search API Key 列表
             serpapi_keys: SerpAPI Key 列表
-            minimax_keys: MiniMax API Key 列表
+            bailian_keys: 百炼 (DashScope) API Key 列表
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
             news_max_age_days: 新闻最大时效（天）
@@ -2329,10 +2400,10 @@ class SearchService:
             self._providers.append(SerpAPISearchProvider(serpapi_keys))
             logger.info(f"已配置 SerpAPI 搜索，共 {len(serpapi_keys)} 个 API Key")
 
-        # 5. MiniMax（Coding Plan Web Search，结构化结果）
-        if minimax_keys:
-            self._providers.append(MiniMaxSearchProvider(minimax_keys))
-            logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
+        # 5. 百炼 (DashScope Web Search，结构化结果)
+        if bailian_keys:
+            self._providers.append(BailianSearchProvider(bailian_keys))
+            logger.info(f"已配置百炼搜索，共 {len(bailian_keys)} 个 API Key")
 
         # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
         searxng_provider = SearXNGSearchProvider(
@@ -3586,7 +3657,7 @@ def get_search_service() -> SearchService:
                     anspire_keys=config.anspire_api_keys,
                     brave_keys=config.brave_api_keys,
                     serpapi_keys=config.serpapi_keys,
-                    minimax_keys=config.minimax_api_keys,
+                    bailian_keys=config.bailian_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
                     news_max_age_days=config.news_max_age_days,

@@ -434,9 +434,9 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {"multi_value": True, "delimiter": ","},
         "display_order": 51,
     },
-    "MINIMAX_API_KEYS": {
-        "title": "MiniMax API Key",
-        "description": "MiniMax API key (search priority: Bocha > Tavily > Brave > SerpAPI > MiniMax > SearXNG).",
+    "BAILIAN_API_KEYS": {
+        "title": "百炼 (DashScope) API Keys",
+        "description": "Bailian (DashScope) API keys for web search (search priority: Bocha > Tavily > Brave > SerpAPI > Bailian > SearXNG).",
         "category": "data_source",
         "data_type": "string",
         "ui_control": "password",

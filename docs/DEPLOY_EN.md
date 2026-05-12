@@ -199,7 +199,7 @@ journalctl -u stock-analyzer -f
 | `AIHUBMIX_KEY` | - | AIHubMix one-key multi-model access (recommended) |
 | `SERPAPI_API_KEYS` | - | SerpAPI realtime financial news search (recommended) |
 | `TAVILY_API_KEYS` | - | Tavily news search (optional) |
-| `MINIMAX_API_KEYS` | - | MiniMax search (optional) |
+| `BAILIAN_API_KEYS` | - | Bailian (DashScope) web search (optional) |
 
 ---
 
@@ -371,7 +371,7 @@ Add these Secrets:
 | `TAVILY_API_KEYS` | Tavily Search API Key | Optional |
 | `BOCHA_API_KEYS` | Bocha Search API Key | Optional |
 | `BRAVE_API_KEYS` | Brave Search API Key | Optional |
-| `MINIMAX_API_KEYS` | MiniMax Coding Plan Web Search | Optional |
+| `BAILIAN_API_KEYS` | Bailian (DashScope) Web Search | Optional |
 | `TUSHARE_TOKEN` | Tushare Token | Optional |
 | `GEMINI_MODEL` | Model name (default gemini-2.0-flash) | Optional |
 

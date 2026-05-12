@@ -108,7 +108,7 @@ class StatusCommand(BotCommand):
         status["search_tavily"] = len(config.tavily_api_keys) > 0
         status["search_brave"] = len(config.brave_api_keys) > 0
         status["search_serpapi"] = len(config.serpapi_keys) > 0
-        status["search_minimax"] = len(config.minimax_api_keys) > 0
+        status["search_bailian"] = len(config.bailian_api_keys) > 0
         status["search_searxng"] = config.has_searxng_enabled()
         
         # 通知渠道状态
@@ -185,7 +185,7 @@ class StatusCommand(BotCommand):
             f"• Tavily: {icon(status['search_tavily'])}",
             f"• Brave: {icon(status['search_brave'])}",
             f"• SerpAPI: {icon(status['search_serpapi'])}",
-            f"• MiniMax: {icon(status['search_minimax'])}",
+            f"• 百炼: {icon(status['search_bailian'])}",
             f"• SearXNG: {icon(status['search_searxng'])}",
             "",
             "**📢 通知渠道**",

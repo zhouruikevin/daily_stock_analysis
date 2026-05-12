@@ -660,7 +660,7 @@ class Config:
     # === 搜索引擎配置（支持多 Key 负载均衡）===
     anspire_api_keys: List[str] = field(default_factory=list)  # Anspire Search API Keys
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
-    minimax_api_keys: List[str] = field(default_factory=list)  # MiniMax API Keys
+    bailian_api_keys: List[str] = field(default_factory=list)  # Bailian (DashScope) API Keys
     tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
     brave_api_keys: List[str] = field(default_factory=list)  # Brave Search API Keys
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
@@ -1245,8 +1245,8 @@ class Config:
         bocha_keys_str = os.getenv('BOCHA_API_KEYS', '')
         bocha_api_keys = [k.strip() for k in bocha_keys_str.split(',') if k.strip()]
 
-        minimax_keys_str = os.getenv('MINIMAX_API_KEYS', '')
-        minimax_api_keys = [k.strip() for k in minimax_keys_str.split(',') if k.strip()]
+        bailian_keys_str = os.getenv('BAILIAN_API_KEYS', '')
+        bailian_api_keys = [k.strip() for k in bailian_keys_str.split(',') if k.strip()]
         
         tavily_keys_str = os.getenv('TAVILY_API_KEYS', '')
         tavily_api_keys = [k.strip() for k in tavily_keys_str.split(',') if k.strip()]
@@ -1375,7 +1375,7 @@ class Config:
             vision_provider_priority=os.getenv('VISION_PROVIDER_PRIORITY', 'gemini,anthropic,openai'),
             anspire_api_keys=anspire_api_keys,
             bocha_api_keys=bocha_api_keys,
-            minimax_api_keys=minimax_api_keys,
+            bailian_api_keys=bailian_api_keys,
             tavily_api_keys=tavily_api_keys,
             brave_api_keys=brave_api_keys,
             serpapi_keys=serpapi_keys,
@@ -2149,7 +2149,7 @@ class Config:
         return bool(
             self.anspire_api_keys
             or self.bocha_api_keys
-            or self.minimax_api_keys
+            or self.bailian_api_keys
             or self.tavily_api_keys
             or self.brave_api_keys
             or self.serpapi_keys
@@ -2396,7 +2396,7 @@ class Config:
         if not self.has_search_capability_enabled():
             issues.append(ConfigIssue(
                 severity="info",
-                message="未配置搜索引擎能力 (Bocha/MiniMax/Tavily/Brave/SerpAPI/SearXNG)，新闻搜索功能将不可用",
+                message="未配置搜索引擎能力 (Bocha/百炼/Tavily/Brave/SerpAPI/SearXNG)，新闻搜索功能将不可用",
                 field="BOCHA_API_KEYS",
             ))
 

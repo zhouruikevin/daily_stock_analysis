@@ -152,7 +152,7 @@ Dockerfile 已采用多阶段构建，前端会在镜像构建时自动打包。
 | `TAVILY_API_KEYS` | Tavily API 密钥（用逗号分隔） |
 | `BOCHA_API_KEYS` | Bocha API 密钥（用逗号分隔） |
 | `BRAVE_API_KEYS` | Brave Search API 密钥（用逗号分隔） |
-| `MINIMAX_API_KEYS` | MiniMax API 密钥（用逗号分隔） |
+| `BAILIAN_API_KEYS` | 百炼 (DashScope) API 密钥（用逗号分隔） |
 | `SEARXNG_BASE_URLS` | SearXNG 实例地址（逗号分隔，无配额兜底，需在 settings.yml 启用 format: json）；留空时默认自动发现公共实例 |
 | `SEARXNG_PUBLIC_INSTANCES_ENABLED` | 是否在 `SEARXNG_BASE_URLS` 为空时自动从 `searx.space` 获取公共实例（默认 `true`） |
 
