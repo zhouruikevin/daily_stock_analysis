@@ -14,6 +14,8 @@ NotificationTestChannel = Literal[
     "telegram",
     "email",
     "pushover",
+    "ntfy",
+    "gotify",
     "pushplus",
     "serverchan3",
     "custom",
@@ -120,7 +122,7 @@ class SetupStatusResponse(BaseModel):
 
 
 class ExportSystemConfigResponse(BaseModel):
-    """Desktop-only export payload for raw `.env` backups."""
+    """Export payload for raw `.env` backups."""
 
     content: str
     config_version: str
@@ -162,7 +164,7 @@ class ValidateSystemConfigRequest(BaseModel):
 
 
 class ImportSystemConfigRequest(BaseModel):
-    """Desktop-only import request payload."""
+    """Import request payload for raw `.env` backups."""
 
     config_version: str
     content: str

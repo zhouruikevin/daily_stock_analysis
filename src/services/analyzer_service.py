@@ -15,12 +15,11 @@ import uuid
 from typing import List, Optional
 
 from src.analyzer import AnalysisResult
-from src.config import get_config, Config
-from src.notification import NotificationService
-from src.enums import ReportType
-from src.core.pipeline import StockAnalysisPipeline
 from src.core.market_review import run_market_review
-
+from src.core.pipeline import StockAnalysisPipeline
+from src.config import Config, get_config
+from src.enums import ReportType
+from src.notification import NotificationService
 
 
 def _get_default_notifier() -> Optional[NotificationService]:
@@ -44,47 +43,48 @@ def analyze_stock(
 ) -> Optional[AnalysisResult]:
     """
     分析单只股票
-    
+
     Args:
         stock_code: 股票代码
         config: 配置对象（可选，默认使用单例）
         full_report: 是否生成完整报告
         notifier: 通知服务（可选，默认自动检测邮件配置）
         _no_auto_notify: 内部参数，是否禁用自动创建 notifier（用于批量分析场景）
-        
+
     Returns:
         分析结果对象
     """
     if config is None:
         config = get_config()
-    
+
     # 如果未显式传入notifier且不禁用自动创建，则检测邮件配置
     if notifier is None and not _no_auto_notify:
         notifier = _get_default_notifier()
-    
+
     # 创建分析流水线
     pipeline = StockAnalysisPipeline(
         config=config,
         query_id=uuid.uuid4().hex,
         query_source="cli"
     )
-    
+
     # 使用通知服务（如果提供）
     if notifier:
         pipeline.notifier = notifier
-    
+
     # 根据full_report参数设置报告类型
     report_type = ReportType.FULL if full_report else ReportType.SIMPLE
-    
+
     # 运行单只股票分析
     result = pipeline.process_single_stock(
         code=stock_code,
         skip_analysis=False,
         single_stock_notify=notifier is not None,
-        report_type=report_type
+        report_type=report_type,
     )
-    
+
     return result
+
 
 def analyze_stocks(
     stock_codes: List[str],
@@ -95,27 +95,27 @@ def analyze_stocks(
 ) -> List[AnalysisResult]:
     """
     分析多只股票
-    
+
     Args:
         stock_codes: 股票代码列表
         config: 配置对象（可选，默认使用单例）
         full_report: 是否生成完整报告
         notifier: 通知服务（可选，默认自动检测邮件配置）
         merge_notification: 是否合并通知为一封邮件（默认 True）
-        
+
     Returns:
         分析结果列表
     """
     if config is None:
         config = get_config()
-    
+
     # 如果未显式传入notifier，自动检测邮件配置
     if notifier is None:
         notifier = _get_default_notifier()
-    
+
     report_type = ReportType.FULL if full_report else ReportType.SIMPLE
     results = []
-    
+
     # 批量分析时不逐只发送通知,最后统一合并发送
     for stock_code in stock_codes:
         result = analyze_stock(
@@ -125,7 +125,7 @@ def analyze_stocks(
         )
         if result:
             results.append(result)
-    
+
     # 合并通知: 所有股票分析完成后,生成汇总报告一次性发送
     if merge_notification and notifier and results:
         try:
@@ -137,45 +137,44 @@ def analyze_stocks(
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(f"合并发送通知失败: {e}")
-    
+
     return results
+
 
 def perform_market_review(
     config: Config = None,
-    notifier: Optional[NotificationService] = None
+    notifier: Optional[NotificationService] = None,
 ) -> Optional[str]:
     """
     执行大盘复盘
-    
+
     Args:
         config: 配置对象（可选，默认使用单例）
         notifier: 通知服务（可选，默认自动检测邮件配置）
-        
+
     Returns:
         复盘报告内容
     """
     if config is None:
         config = get_config()
-    
+
     # 如果未显式传入notifier，自动检测邮件配置
     if notifier is None:
         notifier = _get_default_notifier()
-    
+
     # 创建分析流水线以获取analyzer和search_service
     pipeline = StockAnalysisPipeline(
         config=config,
         query_id=uuid.uuid4().hex,
-        query_source="cli"
+        query_source="cli",
     )
-    
+
     # 使用提供的通知服务或创建新的
     review_notifier = notifier or pipeline.notifier
-    
+
     # 调用大盘复盘函数
     return run_market_review(
         notifier=review_notifier,
         analyzer=pipeline.analyzer,
-        search_service=pipeline.search_service
+        search_service=pipeline.search_service,
     )
-
-

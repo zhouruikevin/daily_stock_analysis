@@ -10,7 +10,7 @@
 """
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Depends, Body
@@ -31,6 +31,7 @@ from api.v1.schemas.history import (
     MarkdownReportResponse,
     HistoryTrendItem,
     HistoryTrendResponse,
+    RunDiagnosticSummaryResponse,
 )
 from api.v1.schemas.common import ErrorResponse
 from src.storage import DatabaseManager
@@ -46,7 +47,13 @@ from src.utils.data_processing import (
     normalize_model_used,
     extract_fundamental_detail_fields,
     extract_board_detail_fields,
+    extract_realtime_detail_fields,
 )
+from src.analysis_context_pack_overview import (
+    extract_analysis_context_pack_overview,
+    sanitize_context_snapshot_for_api,
+)
+from src.market_phase_summary import extract_market_phase_summary
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +114,15 @@ def get_history_list(
                 stock_code=item.get("stock_code", ""),
                 stock_name=item.get("stock_name"),
                 report_type=item.get("report_type"),
+                trend_prediction=item.get("trend_prediction"),
+                analysis_summary=item.get("analysis_summary"),
                 sentiment_score=item.get("sentiment_score"),
                 operation_advice=item.get("operation_advice"),
+                current_price=item.get("current_price"),
+                change_pct=item.get("change_pct"),
+                volume_ratio=item.get("volume_ratio"),
+                turnover_rate=item.get("turnover_rate"),
+                model_used=item.get("model_used"),
                 created_at=item.get("created_at")
             )
             for item in result.get("items", [])
@@ -302,26 +316,13 @@ def get_history_detail(
         # 从 context_snapshot 中提取价格信息
         # 注意：使用 `is None` 而非 `or`，避免把 0.0（平盘）误判为缺失值；
         # 同时不混用 `change_60d`（60 日累计涨跌幅）作为日内 change_pct 的兜底。
-        current_price = None
-        change_pct = None
         context_snapshot = result.get("context_snapshot")
-        if context_snapshot and isinstance(context_snapshot, dict):
-            # 优先从 enhanced_context.realtime 获取
-            enhanced_context = context_snapshot.get("enhanced_context") or {}
-            realtime = enhanced_context.get("realtime") or {}
-            current_price = realtime.get("price")
-            change_pct = realtime.get("change_pct")
-
-            # 缺失时再从 realtime_quote_raw 兜底
-            realtime_quote_raw = context_snapshot.get("realtime_quote_raw")
-            if not isinstance(realtime_quote_raw, dict):
-                realtime_quote_raw = {}
-            if current_price is None:
-                current_price = realtime_quote_raw.get("price")
-            if change_pct is None:
-                change_pct = realtime_quote_raw.get("change_pct")
-            if change_pct is None:
-                change_pct = realtime_quote_raw.get("pct_chg")
+        analysis_context_pack_overview = extract_analysis_context_pack_overview(context_snapshot)
+        market_phase_summary = extract_market_phase_summary(context_snapshot)
+        api_context_snapshot = sanitize_context_snapshot_for_api(context_snapshot)
+        realtime_fields = extract_realtime_detail_fields(context_snapshot)
+        current_price = realtime_fields.get("current_price")
+        change_pct = realtime_fields.get("change_pct")
         
         raw_result = result.get("raw_result")
         if not isinstance(raw_result, dict):
@@ -352,7 +353,8 @@ def get_history_detail(
             created_at=result.get("created_at"),
             current_price=current_price,
             change_pct=change_pct,
-            model_used=normalize_model_used(result.get("model_used"))
+            model_used=normalize_model_used(result.get("model_used")),
+            market_phase_summary=market_phase_summary,
         )
         
         summary = ReportSummary(
@@ -396,7 +398,8 @@ def get_history_detail(
         details = ReportDetails(
             news_content=result.get("news_content"),
             raw_result=result.get("raw_result"),
-            context_snapshot=result.get("context_snapshot"),
+            context_snapshot=api_context_snapshot,
+            analysis_context_pack_overview=analysis_context_pack_overview,
             financial_report=extracted_fundamental.get("financial_report"),
             dividend_metrics=extracted_fundamental.get("dividend_metrics"),
             belong_boards=extracted_boards.get("belong_boards"),
@@ -420,6 +423,49 @@ def get_history_detail(
                 "error": "internal_error",
                 "message": f"查询历史详情失败: {str(e)}"
             }
+        )
+
+
+@router.get(
+    "/{record_id}/diagnostics",
+    response_model=RunDiagnosticSummaryResponse,
+    responses={
+        200: {"description": "运行诊断摘要"},
+        404: {"description": "报告不存在", "model": ErrorResponse},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="获取历史报告运行诊断摘要",
+    description="根据分析历史记录 ID 或 query_id 获取用户可读诊断摘要和脱敏复制文本。",
+)
+def get_history_diagnostics(
+    record_id: str,
+    db_manager: DatabaseManager = Depends(get_database_manager),
+) -> RunDiagnosticSummaryResponse:
+    """
+    获取历史报告运行诊断摘要。
+    """
+    try:
+        service = HistoryService(db_manager)
+        summary = service.resolve_and_get_diagnostics(record_id)
+        if summary is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "not_found",
+                    "message": f"未找到 id/query_id={record_id} 的分析记录",
+                },
+            )
+        return RunDiagnosticSummaryResponse.model_validate(summary)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"查询运行诊断摘要失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": f"查询运行诊断摘要失败: {str(e)}",
+            },
         )
 
 

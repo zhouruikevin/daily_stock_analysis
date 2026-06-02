@@ -5,21 +5,62 @@
 
 // ============ Request Types ============
 
+export type StockReportType = 'simple' | 'detailed' | 'full' | 'brief';
+export type ReportType = StockReportType | 'market_review';
+
 export interface AnalysisRequest {
   stockCode?: string;
   stockCodes?: string[];
-  reportType?: 'simple' | 'detailed' | 'full' | 'brief';
+  reportType?: StockReportType;
   forceRefresh?: boolean;
   asyncMode?: boolean;
   stockName?: string;
   originalQuery?: string;
   selectionSource?: 'manual' | 'autocomplete' | 'import' | 'image';
   notify?: boolean;
+  skills?: string[];
+}
+
+export interface MarketReviewRequest {
+  sendNotification?: boolean;
+}
+
+export interface MarketReviewAccepted {
+  status: 'accepted';
+  message: string;
+  sendNotification: boolean;
+  traceId?: string;
+  taskId?: string;
 }
 
 // ============ Report Types ============
 
 export type ReportLanguage = 'zh' | 'en';
+
+export type MarketPhaseValue =
+  | 'premarket'
+  | 'intraday'
+  | 'lunch_break'
+  | 'closing_auction'
+  | 'postmarket'
+  | 'non_trading'
+  | 'unknown';
+
+export interface MarketPhaseSummary {
+  market?: string | null;
+  phase: MarketPhaseValue;
+  marketLocalTime?: string | null;
+  sessionDate?: string | null;
+  effectiveDailyBarDate?: string | null;
+  isTradingDay?: boolean | null;
+  isMarketOpenNow?: boolean | null;
+  isPartialBar?: boolean | null;
+  minutesToOpen?: number | null;
+  minutesToClose?: number | null;
+  triggerSource?: string | null;
+  analysisIntent?: string | null;
+  warnings: string[];
+}
 
 /** Report metadata */
 export interface ReportMeta {
@@ -27,12 +68,13 @@ export interface ReportMeta {
   queryId: string;
   stockCode: string;
   stockName: string;
-  reportType: 'simple' | 'detailed' | 'full' | 'brief';
+  reportType: ReportType;
   reportLanguage?: ReportLanguage;
   createdAt: string;
   currentPrice?: number;
   changePct?: number;
-  modelUsed?: string;  // LLM model used for analysis
+  modelUsed?: string;  // Display-only model snapshot from persisted history; not used for runtime model selection
+  marketPhaseSummary?: MarketPhaseSummary | null;
 }
 
 /** Sentiment label */
@@ -81,11 +123,73 @@ export interface SectorRankings {
   bottom?: SectorRankingItem[];
 }
 
+export type AnalysisContextPackBlockStatus =
+  | 'available'
+  | 'missing'
+  | 'not_supported'
+  | 'fallback'
+  | 'stale'
+  | 'estimated'
+  | 'partial'
+  | 'fetch_failed';
+
+export interface AnalysisContextPackOverviewSubject {
+  code: string;
+  stockName?: string | null;
+  market?: string | null;
+}
+
+export interface AnalysisContextPackOverviewBlock {
+  key: string;
+  label: string;
+  status: AnalysisContextPackBlockStatus;
+  source?: string | null;
+  warnings: string[];
+  missingReasons: string[];
+}
+
+export interface AnalysisContextPackOverviewCounts {
+  available: number;
+  missing: number;
+  notSupported: number;
+  fallback: number;
+  stale: number;
+  estimated: number;
+  partial: number;
+  fetchFailed: number;
+}
+
+export interface AnalysisContextPackOverviewMetadata {
+  triggerSource?: string | null;
+  newsResultCount?: number | null;
+}
+
+export type AnalysisContextPackDataQualityLevel = 'good' | 'usable' | 'limited' | 'poor';
+
+export interface AnalysisContextPackOverviewDataQuality {
+  overallScore?: number | null;
+  level?: AnalysisContextPackDataQualityLevel | null;
+  blockScores: Record<string, number>;
+  limitations: string[];
+}
+
+export interface AnalysisContextPackOverview {
+  packVersion: string;
+  createdAt?: string | null;
+  subject: AnalysisContextPackOverviewSubject;
+  blocks: AnalysisContextPackOverviewBlock[];
+  counts: AnalysisContextPackOverviewCounts;
+  dataQuality?: AnalysisContextPackOverviewDataQuality | null;
+  warnings: string[];
+  metadata: AnalysisContextPackOverviewMetadata;
+}
+
 /** Details section */
 export interface ReportDetails {
   newsContent?: string;
   rawResult?: Record<string, unknown>;
   contextSnapshot?: Record<string, unknown>;
+  analysisContextPackOverview?: AnalysisContextPackOverview | null;
   financialReport?: Record<string, unknown>;
   dividendMetrics?: Record<string, unknown>;
   belongBoards?: RelatedBoard[];
@@ -102,24 +206,59 @@ export interface AnalysisReport {
 
 // ============ Analysis Result Types ============
 
+export type RunDiagnosticStatus = 'normal' | 'degraded' | 'failed' | 'unknown';
+
+export type RunDiagnosticComponentStatus =
+  | 'ok'
+  | 'degraded'
+  | 'failed'
+  | 'unknown'
+  | 'not_configured'
+  | 'skipped';
+
+export interface RunDiagnosticComponent {
+  key: string;
+  label: string;
+  status: RunDiagnosticComponentStatus;
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+export interface RunDiagnosticSummary {
+  traceId?: string;
+  taskId?: string;
+  queryId?: string;
+  stockCode?: string;
+  triggerSource?: string;
+  status: RunDiagnosticStatus;
+  statusLabel: string;
+  reason: string;
+  components: Record<string, RunDiagnosticComponent>;
+  copyText: string;
+}
+
 /** Sync analysis response */
 export interface AnalysisResult {
   queryId: string;
+  traceId?: string;
   stockCode: string;
   stockName: string;
   report: AnalysisReport;
+  diagnosticSummary?: RunDiagnosticSummary;
   createdAt: string;
 }
 
 /** Async task accepted response */
 export interface TaskAccepted {
   taskId: string;
+  traceId?: string;
   status: 'pending' | 'processing';
   message?: string;
 }
 
 export interface BatchTaskAcceptedItem {
   taskId: string;
+  traceId?: string;
   stockCode: string;
   status: 'pending' | 'processing';
   message?: string;
@@ -144,18 +283,22 @@ export type AnalyzeResponse = AnalysisResult | AnalyzeAsyncResponse;
 /** Task status */
 export interface TaskStatus {
   taskId: string;
+  traceId?: string;
   status: 'pending' | 'processing' | 'completed' | 'failed';
   progress?: number;
   result?: AnalysisResult;
+  marketReviewReport?: string;
   error?: string;
   stockName?: string;
   originalQuery?: string;
   selectionSource?: string;
+  skills?: string[];
 }
 
 /** Task details used by task list and SSE events */
 export interface TaskInfo {
   taskId: string;
+  traceId?: string;
   stockCode: string;
   stockName?: string;
   status: 'pending' | 'processing' | 'completed' | 'failed';
@@ -194,10 +337,25 @@ export interface HistoryItem {
   queryId: string;  // Linked analysis query ID
   stockCode: string;
   stockName?: string;
-  reportType?: string;
+  reportType?: ReportType;
+  trendPrediction?: string;
+  analysisSummary?: string;
   sentimentScore?: number;
   operationAdvice?: string;
+  currentPrice?: number;
+  changePct?: number;
+  volumeRatio?: number;
+  turnoverRate?: number;
+  modelUsed?: string;  // Display-only model snapshot from persisted history; runtime provider/model/base URL still come from analyzer configuration
   createdAt: string;
+}
+
+export type StockHistoryRange = 'all' | '30d' | '90d';
+
+export interface StockHistoryFilters {
+  range: StockHistoryRange;
+  model: string;
+  sort: 'desc' | 'asc';
 }
 
 /** History list response */

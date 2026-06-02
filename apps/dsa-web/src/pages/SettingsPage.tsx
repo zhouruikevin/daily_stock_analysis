@@ -2,6 +2,7 @@ import type React from 'react';
 import { useEffect, useRef, useState } from 'react';
 import { useAuth, useSystemConfig } from '../hooks';
 import { createParsedApiError, getParsedApiError, type ParsedApiError } from '../api/error';
+import { alphasiftApi, notifyAlphaSiftConfigChanged, notifySystemConfigChanged } from '../api/alphasift';
 import { systemConfigApi } from '../api/systemConfig';
 import { ApiErrorAlert, Button, ConfirmDialog, EmptyState } from '../components/common';
 import {
@@ -14,6 +15,7 @@ import {
   SettingsAlert,
   SettingsField,
   SettingsLoading,
+  SettingsPanelErrorBoundary,
   SettingsSectionCard,
 } from '../components/settings';
 import { WEB_BUILD_INFO } from '../utils/constants';
@@ -25,6 +27,7 @@ type DesktopWindow = Window & {
     version?: unknown;
     getUpdateState?: () => Promise<RawDesktopUpdateState>;
     checkForUpdates?: () => Promise<RawDesktopUpdateState>;
+    installDownloadedUpdate?: () => Promise<boolean>;
     openReleasePage?: (releaseUrl?: string) => Promise<boolean>;
     onUpdateStateChange?: (listener: (state: RawDesktopUpdateState) => void) => (() => void) | void;
   };
@@ -32,6 +35,7 @@ type DesktopWindow = Window & {
 
 type DesktopUpdateState = {
   status?: string;
+  updateMode?: string;
   currentVersion?: string;
   latestVersion?: string;
   releaseUrl?: string;
@@ -40,10 +44,14 @@ type DesktopUpdateState = {
   message?: string;
   releaseName?: string;
   tagName?: string;
+  downloadPercent?: number | null;
+  downloadedBytes?: number | null;
+  totalBytes?: number | null;
 };
 
 type RawDesktopUpdateState = {
   status?: unknown;
+  updateMode?: unknown;
   currentVersion?: unknown;
   latestVersion?: unknown;
   releaseUrl?: unknown;
@@ -52,10 +60,29 @@ type RawDesktopUpdateState = {
   message?: unknown;
   releaseName?: unknown;
   tagName?: unknown;
+  downloadPercent?: unknown;
+  downloadedBytes?: unknown;
+  totalBytes?: unknown;
+};
+
+type DesktopUpdateNotice = {
+  title: string;
+  message: string;
+  variant: 'error' | 'success' | 'warning';
+  actionLabel?: string;
+  actionKind?: 'release' | 'install';
 };
 
 function trimDesktopRuntimeString(value: unknown) {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeDesktopRuntimeNumber(value: unknown) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const numberValue = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(numberValue) ? numberValue : null;
 }
 
 function getDesktopRuntimeApi() {
@@ -77,6 +104,7 @@ function normalizeDesktopUpdateState(state: RawDesktopUpdateState | null | undef
 
   return {
     status: trimDesktopRuntimeString(state.status) || 'idle',
+    updateMode: trimDesktopRuntimeString(state.updateMode) || 'manual',
     currentVersion: trimDesktopRuntimeString(state.currentVersion),
     latestVersion: trimDesktopRuntimeString(state.latestVersion),
     releaseUrl: trimDesktopRuntimeString(state.releaseUrl),
@@ -85,10 +113,13 @@ function normalizeDesktopUpdateState(state: RawDesktopUpdateState | null | undef
     message: trimDesktopRuntimeString(state.message),
     releaseName: trimDesktopRuntimeString(state.releaseName),
     tagName: trimDesktopRuntimeString(state.tagName),
+    downloadPercent: normalizeDesktopRuntimeNumber(state.downloadPercent),
+    downloadedBytes: normalizeDesktopRuntimeNumber(state.downloadedBytes),
+    totalBytes: normalizeDesktopRuntimeNumber(state.totalBytes),
   };
 }
 
-function getDesktopUpdateNotice(state: DesktopUpdateState | null) {
+function getDesktopUpdateNotice(state: DesktopUpdateState | null): DesktopUpdateNotice | null {
   if (!state) {
     return null;
   }
@@ -100,7 +131,35 @@ function getDesktopUpdateNotice(state: DesktopUpdateState | null) {
       title: '发现新版本',
       message: `当前 ${currentLabel}，最新 ${latestLabel}。${state.message || '可前往 GitHub Releases 下载更新。'}`,
       variant: 'warning' as const,
-      actionLabel: '前往下载',
+      actionLabel: state.updateMode === 'auto' ? undefined : '前往下载',
+      actionKind: state.updateMode === 'auto' ? undefined : 'release',
+    };
+  }
+
+  if (state.status === 'downloading') {
+    const percentText = typeof state.downloadPercent === 'number' ? `（${state.downloadPercent}%）` : '';
+    return {
+      title: '正在下载更新',
+      message: state.message || `正在后台下载桌面端更新${percentText}。`,
+      variant: 'warning' as const,
+    };
+  }
+
+  if (state.status === 'update-downloaded') {
+    return {
+      title: '更新已下载',
+      message: state.message || '新版本已下载，可重启应用完成安装。',
+      variant: 'success' as const,
+      actionLabel: '重启安装',
+      actionKind: 'install',
+    };
+  }
+
+  if (state.status === 'installing') {
+    return {
+      title: '正在安装更新',
+      message: state.message || '正在重启并安装更新。',
+      variant: 'warning' as const,
     };
   }
 
@@ -125,30 +184,35 @@ function getDesktopUpdateNotice(state: DesktopUpdateState | null) {
       title: '检查更新失败',
       message: state.message || '无法完成更新检查，请稍后重试。',
       variant: 'error' as const,
+      actionLabel: state.updateMode === 'auto' && state.releaseUrl ? '前往下载' : undefined,
+      actionKind: state.updateMode === 'auto' && state.releaseUrl ? 'release' : undefined,
     };
   }
 
   return null;
 }
 
-function formatDesktopEnvFilename() {
+function formatEnvBackupFilename(isDesktopRuntime: boolean) {
   const now = new Date();
   const pad = (value: number) => value.toString().padStart(2, '0');
   const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
   const time = `${pad(now.getHours())}${pad(now.getMinutes())}`;
-  return `dsa-desktop-env_${date}_${time}.env`;
+  return `${isDesktopRuntime ? 'dsa-desktop-env' : 'dsa-env'}_${date}_${time}.env`;
 }
 
 const SettingsPage: React.FC = () => {
-  const { passwordChangeable } = useAuth();
-  const [desktopActionError, setDesktopActionError] = useState<ParsedApiError | null>(null);
-  const [desktopActionSuccess, setDesktopActionSuccess] = useState<string>('');
+  const { authEnabled, passwordChangeable } = useAuth();
+  const [envBackupActionError, setEnvBackupActionError] = useState<ParsedApiError | null>(null);
+  const [envBackupActionSuccess, setEnvBackupActionSuccess] = useState<string>('');
+  const [alphaSiftActionError, setAlphaSiftActionError] = useState<ParsedApiError | null>(null);
+  const [alphaSiftActionSuccess, setAlphaSiftActionSuccess] = useState<string>('');
   const [isExportingEnv, setIsExportingEnv] = useState(false);
   const [isImportingEnv, setIsImportingEnv] = useState(false);
+  const [isUpdatingAlphaSift, setIsUpdatingAlphaSift] = useState(false);
   const [showImportConfirm, setShowImportConfirm] = useState(false);
   const [desktopUpdateState, setDesktopUpdateState] = useState<DesktopUpdateState | null>(null);
   const [isCheckingDesktopUpdate, setIsCheckingDesktopUpdate] = useState(false);
-  const desktopImportRef = useRef<HTMLInputElement | null>(null);
+  const envBackupImportRef = useRef<HTMLInputElement | null>(null);
   const desktopRuntimeApi = getDesktopRuntimeApi();
   const isDesktopRuntime = Boolean(desktopRuntimeApi);
   const canCheckDesktopUpdate = Boolean(
@@ -182,6 +246,7 @@ const SettingsPage: React.FC = () => {
     save,
     resetDraft,
     setDraftValue,
+    getChangedItems,
     refreshAfterExternalSave,
     configVersion,
     maskToken,
@@ -251,12 +316,15 @@ const SettingsPage: React.FC = () => {
 
   const rawActiveItems = itemsByCategory[activeCategory] || [];
   const rawActiveItemMap = new Map(rawActiveItems.map((item) => [item.key, String(item.value ?? '')]));
+  const alphasiftItem = (itemsByCategory.data_source || []).find((item) => item.key === 'ALPHASIFT_ENABLED');
+  const alphasiftEnabled = String(alphasiftItem?.value ?? '').trim().toLowerCase() === 'true';
   const hasConfiguredChannels = Boolean((rawActiveItemMap.get('LLM_CHANNELS') || '').trim());
   const hasLitellmConfig = Boolean((rawActiveItemMap.get('LITELLM_CONFIG') || '').trim());
 
-  // Hide channel-managed and legacy provider-specific LLM keys from the
-  // generic form only when channel config is the active runtime source.
-  const LLM_CHANNEL_KEY_RE = /^LLM_[A-Z0-9]+_(PROTOCOL|BASE_URL|API_KEY|API_KEYS|MODELS|EXTRA_HEADERS|ENABLED)$/;
+  // UI rendering rule only: hide channel-managed and legacy provider-specific
+  // LLM keys from generic fields when channel mode is active. This does not
+  // alter save/refresh payloads or config migration/rollback behavior.
+  const LLM_CHANNEL_KEY_RE = /^LLM_[A-Z0-9_]+_(PROTOCOL|BASE_URL|API_KEY|API_KEYS|MODELS|EXTRA_HEADERS|ENABLED)$/;
   const AI_MODEL_HIDDEN_KEYS = new Set([
     'LLM_CHANNELS',
     'LLM_TEMPERATURE',
@@ -304,42 +372,43 @@ const SettingsPage: React.FC = () => {
       : activeCategory === 'agent'
         ? rawActiveItems.filter((item) => !AGENT_HIDDEN_KEYS.has(item.key))
       : rawActiveItems;
-  const desktopActionDisabled = isLoading || isSaving || isExportingEnv || isImportingEnv;
+  const isEnvBackupAllowed = isDesktopRuntime || authEnabled;
+  const envBackupActionDisabled = isLoading || isSaving || isExportingEnv || isImportingEnv || !isEnvBackupAllowed;
 
-  const downloadDesktopEnv = async () => {
-    setDesktopActionError(null);
-    setDesktopActionSuccess('');
+  const downloadEnvBackup = async () => {
+    setEnvBackupActionError(null);
+    setEnvBackupActionSuccess('');
     setIsExportingEnv(true);
     try {
-      const payload = await systemConfigApi.exportDesktopEnv();
+      const payload = await systemConfigApi.exportEnv();
       const blob = new Blob([payload.content], { type: 'text/plain;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = url;
-      anchor.download = formatDesktopEnvFilename();
+      anchor.download = formatEnvBackupFilename(isDesktopRuntime);
       document.body.appendChild(anchor);
       anchor.click();
       document.body.removeChild(anchor);
       URL.revokeObjectURL(url);
-      setDesktopActionSuccess('已导出当前已保存的 .env 备份。');
+      setEnvBackupActionSuccess('已导出当前已保存的 .env 备份。');
     } catch (error: unknown) {
-      setDesktopActionError(getParsedApiError(error));
+      setEnvBackupActionError(getParsedApiError(error));
     } finally {
       setIsExportingEnv(false);
     }
   };
 
-  const beginDesktopImport = () => {
-    setDesktopActionError(null);
-    setDesktopActionSuccess('');
+  const beginEnvBackupImport = () => {
+    setEnvBackupActionError(null);
+    setEnvBackupActionSuccess('');
     if (hasDirty) {
       setShowImportConfirm(true);
       return;
     }
-    desktopImportRef.current?.click();
+    envBackupImportRef.current?.click();
   };
 
-  const handleDesktopImportFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleEnvBackupImportFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = '';
     setShowImportConfirm(false);
@@ -347,29 +416,30 @@ const SettingsPage: React.FC = () => {
       return;
     }
 
-    setDesktopActionError(null);
-    setDesktopActionSuccess('');
+    setEnvBackupActionError(null);
+    setEnvBackupActionSuccess('');
     setIsImportingEnv(true);
     try {
       const content = await file.text();
-      await systemConfigApi.importDesktopEnv({
+      await systemConfigApi.importEnv({
         configVersion,
         content,
         reloadNow: true,
       });
       const reloaded = await load();
       if (!reloaded) {
-        setDesktopActionError(createParsedApiError({
+        setEnvBackupActionError(createParsedApiError({
           title: '配置已导入但刷新失败',
           message: '备份已导入，但重新加载配置失败，请手动重载页面。',
-          rawMessage: 'Desktop env import succeeded but config refresh failed',
+          rawMessage: 'Env import succeeded but config refresh failed',
           category: 'http_error',
         }));
         return;
       }
-      setDesktopActionSuccess('已导入 .env 备份并重新加载配置。');
+      notifySystemConfigChanged();
+      setEnvBackupActionSuccess('已导入 .env 备份并重新加载配置。');
     } catch (error: unknown) {
-      setDesktopActionError(getParsedApiError(error));
+      setEnvBackupActionError(getParsedApiError(error));
     } finally {
       setIsImportingEnv(false);
     }
@@ -400,6 +470,66 @@ const SettingsPage: React.FC = () => {
     }
   };
 
+  const updateAlphaSiftEnabled = async (nextEnabled: boolean) => {
+    setAlphaSiftActionError(null);
+    setAlphaSiftActionSuccess('');
+    setIsUpdatingAlphaSift(true);
+    try {
+      if (nextEnabled) {
+        await alphasiftApi.enable();
+        await refreshAfterExternalSave(['ALPHASIFT_ENABLED']);
+        setAlphaSiftActionSuccess('已开启 AlphaSift 选股。');
+        return;
+      }
+
+      await systemConfigApi.update({
+        configVersion,
+        maskToken,
+        reloadNow: true,
+        items: [{ key: 'ALPHASIFT_ENABLED', value: 'false' }],
+      });
+      notifyAlphaSiftConfigChanged();
+      await refreshAfterExternalSave(['ALPHASIFT_ENABLED']);
+      setAlphaSiftActionSuccess('已关闭 AlphaSift 选股。');
+    } catch (error: unknown) {
+      setAlphaSiftActionError(getParsedApiError(error));
+      await refreshAfterExternalSave(['ALPHASIFT_ENABLED']);
+    } finally {
+      setIsUpdatingAlphaSift(false);
+    }
+  };
+
+  const handleSaveConfig = async () => {
+    const changedItems = getChangedItems();
+    const changedAlphaSiftItem = changedItems.find((item) => item.key === 'ALPHASIFT_ENABLED');
+    const result = await save();
+    if (!result.success) {
+      return;
+    }
+    notifySystemConfigChanged();
+    if (!changedAlphaSiftItem) {
+      return;
+    }
+
+    setAlphaSiftActionError(null);
+    setAlphaSiftActionSuccess('');
+    try {
+      const isAlphaSiftEnabled = changedAlphaSiftItem.value.trim().toLowerCase() === 'true';
+      if (isAlphaSiftEnabled) {
+        await alphasiftApi.enable();
+        await refreshAfterExternalSave(['ALPHASIFT_ENABLED']);
+        setAlphaSiftActionSuccess('已开启 AlphaSift 选股。');
+        return;
+      }
+
+      notifyAlphaSiftConfigChanged();
+      setAlphaSiftActionSuccess('已关闭 AlphaSift 选股。');
+    } catch (error: unknown) {
+      setAlphaSiftActionError(getParsedApiError(error));
+      await refreshAfterExternalSave(['ALPHASIFT_ENABLED']);
+    }
+  };
+
   const openDesktopReleasePage = async () => {
     if (!desktopRuntimeApi?.openReleasePage) {
       return;
@@ -408,7 +538,67 @@ const SettingsPage: React.FC = () => {
     await desktopRuntimeApi.openReleasePage(desktopUpdateState?.releaseUrl);
   };
 
+  const installDesktopUpdate = async () => {
+    if (!desktopRuntimeApi?.installDownloadedUpdate) {
+      setDesktopUpdateState((current) => ({
+        ...(current || {}),
+        status: 'error',
+        message: '当前桌面端不支持自动安装更新，请前往发布页手动更新。',
+      }));
+      return;
+    }
+
+    try {
+      setDesktopUpdateState((current) => ({
+        ...(current || {}),
+        status: 'installing',
+        message: '正在重启并安装更新...',
+      }));
+      await desktopRuntimeApi.installDownloadedUpdate();
+    } catch (error: unknown) {
+      setDesktopUpdateState((current) => ({
+        ...(current || {}),
+        status: 'error',
+        message: error instanceof Error ? error.message : '自动安装更新失败，请前往发布页手动更新。',
+      }));
+    }
+  };
+
   const desktopUpdateNotice = getDesktopUpdateNotice(desktopUpdateState);
+  const shouldGuardActiveConfigPanel = activeCategory === 'notification' || activeCategory === 'agent';
+  const activeConfigPanelErrorTitle = activeCategory === 'agent' ? 'Agent 设置' : '通知设置';
+  const settingsPanelDiagnosticHint = isDesktopRuntime ? (
+    <>
+      请查看并提供桌面端日志
+      <code className="mx-1 rounded bg-background/45 px-1 py-0.5 font-mono text-xs">desktop.log</code>
+      ，同时补充 release 版本、Windows 版本和触发入口。
+    </>
+  ) : (
+    <>请查看浏览器开发者工具控制台与后端日志，并补充 release 版本、浏览器版本和触发入口。</>
+  );
+  const activeConfigPanel = activeItems.length ? (
+    <SettingsSectionCard
+      title="当前分类配置项"
+      description={getCategoryDescriptionZh(activeCategory as SystemConfigCategory, '') || '使用统一字段卡片维护当前分类的系统配置。'}
+    >
+      {activeItems.map((item) => (
+        <SettingsField
+          key={item.key}
+          item={item}
+          value={item.value}
+          disabled={isSaving}
+          onChange={setDraftValue}
+          issues={issueByKey[item.key] || []}
+        />
+      ))}
+    </SettingsSectionCard>
+  ) : (
+    <EmptyState
+      title="当前分类下暂无配置项"
+      description="当前分类没有可编辑字段；可切换左侧分类继续查看其它系统配置。"
+      className="settings-surface-panel settings-border-strong border-none bg-transparent shadow-none"
+    />
+  );
 
   return (
     <div className="settings-page min-h-full px-4 pb-6 pt-4 md:px-6">
@@ -433,7 +623,7 @@ const SettingsPage: React.FC = () => {
             <Button
               type="button"
               variant="settings-primary"
-              onClick={() => void save()}
+              onClick={() => void handleSaveConfig()}
               disabled={!hasDirty || isSaving || isLoading}
               isLoading={isSaving}
               loadingText="保存中..."
@@ -476,6 +666,55 @@ const SettingsPage: React.FC = () => {
           </aside>
 
           <section className="space-y-4">
+            {alphasiftItem ? (
+              <SettingsSectionCard
+                title="AlphaSift 选股"
+                description="启用第三方项目 AlphaSift 提供的选股能力。"
+              >
+                <div className="flex flex-col gap-4 rounded-2xl border settings-border bg-background/35 px-4 py-4 md:flex-row md:items-center md:justify-between">
+                  <div>
+                    <p className="text-sm font-semibold text-foreground">
+                      {alphasiftEnabled ? '选股已开启' : '选股未开启'}
+                    </p>
+                    <p className="mt-1 text-xs leading-6 text-muted-text">
+                      开启后左侧导航会显示“选股”，策略、数据处理和候选生成来自 AlphaSift，DSA 只负责调用与展示。
+                    </p>
+                    <p className="mt-2 text-xs leading-6 text-amber-700 dark:text-amber-300">
+                      风险提示：选股结果仅用于研究和辅助判断，不构成投资建议；市场有风险，交易决策和损益由使用者自行承担。
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="settings-secondary"
+                      onClick={() => setActiveCategory('data_source')}
+                    >
+                      查看配置项
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={alphasiftEnabled ? 'settings-secondary' : 'settings-primary'}
+                      onClick={() => void updateAlphaSiftEnabled(!alphasiftEnabled)}
+                      disabled={isSaving || isLoading || isUpdatingAlphaSift}
+                      isLoading={isUpdatingAlphaSift}
+                      loadingText={alphasiftEnabled ? '关闭中...' : '开启中...'}
+                    >
+                      {alphasiftEnabled ? '关闭选股' : '开启选股'}
+                    </Button>
+                  </div>
+                </div>
+                {alphaSiftActionError ? (
+                  <div className="mt-3">
+                    <ApiErrorAlert error={alphaSiftActionError} />
+                  </div>
+                ) : null}
+                {!alphaSiftActionError && alphaSiftActionSuccess ? (
+                  <div className="mt-3">
+                    <SettingsAlert title="操作成功" message={alphaSiftActionSuccess} variant="success" />
+                  </div>
+                ) : null}
+              </SettingsSectionCard>
+            ) : null}
             {activeCategory === 'system' ? <AuthSettingsCard /> : null}
             {activeCategory === 'system' ? (
               <SettingsSectionCard
@@ -529,7 +768,7 @@ const SettingsPage: React.FC = () => {
                       <div>
                         <p className="text-sm font-medium text-foreground">桌面端更新</p>
                         <p className="text-xs leading-6 text-muted-text">
-                          启动后会自动检查 GitHub Releases 最新正式版；发现更新时仅提醒并跳转下载页，不会静默下载或自动安装。
+                          启动后会自动检查 GitHub Releases 最新正式版；Windows 安装版会后台下载更新，确认后静默重启安装。
                         </p>
                       </div>
                       <Button
@@ -550,6 +789,10 @@ const SettingsPage: React.FC = () => {
                         variant={desktopUpdateNotice.variant}
                         actionLabel={desktopUpdateNotice.actionLabel}
                         onAction={desktopUpdateNotice.actionLabel ? () => {
+                          if (desktopUpdateNotice.actionKind === 'install') {
+                            void installDesktopUpdate();
+                            return;
+                          }
                           void openDesktopReleasePage();
                         } : undefined}
                       />
@@ -567,18 +810,24 @@ const SettingsPage: React.FC = () => {
                 ) : null}
               </SettingsSectionCard>
             ) : null}
-            {activeCategory === 'system' && isDesktopRuntime ? (
+            {activeCategory === 'system' ? (
               <SettingsSectionCard
                 title="配置备份"
-                description="导出当前已保存的 .env 备份，或从备份文件恢复桌面端配置。导入会覆盖备份中出现的键并立即重载。"
+                description="导出当前已保存的 .env 备份，或从备份文件恢复配置。导入会覆盖备份中出现的键并立即重载。"
               >
                 <div className="space-y-4">
+                  {!isEnvBackupAllowed ? (
+                    <p className="text-xs leading-6 text-amber-700 dark:text-amber-300">
+                      当前 Web 端未开启管理员鉴权，导出/导入 `.env` 备份功能已停用；请先将
+                      `ADMIN_AUTH_ENABLED` 设为 `true` 并完成管理员登录后再使用。
+                    </p>
+                  ) : null}
                   <div className="flex flex-wrap items-center gap-3">
                     <Button
                       type="button"
                       variant="settings-secondary"
-                      onClick={() => void downloadDesktopEnv()}
-                      disabled={desktopActionDisabled}
+                      onClick={() => void downloadEnvBackup()}
+                      disabled={envBackupActionDisabled}
                       isLoading={isExportingEnv}
                       loadingText="导出中..."
                     >
@@ -587,35 +836,35 @@ const SettingsPage: React.FC = () => {
                     <Button
                       type="button"
                       variant="settings-primary"
-                      onClick={beginDesktopImport}
-                      disabled={desktopActionDisabled}
+                      onClick={beginEnvBackupImport}
+                      disabled={envBackupActionDisabled}
                       isLoading={isImportingEnv}
                       loadingText="导入中..."
                     >
                       导入 .env
                     </Button>
                     <input
-                      ref={desktopImportRef}
+                      ref={envBackupImportRef}
                       type="file"
                       accept=".env,.txt"
                       className="hidden"
                       onChange={(event) => {
-                        void handleDesktopImportFile(event);
+                        void handleEnvBackupImportFile(event);
                       }}
                     />
                   </div>
                   <p className="text-xs leading-6 text-muted-text">
                     导出内容仅包含当前已保存配置，不包含页面上尚未保存的本地草稿。
                   </p>
-                  {desktopActionError ? (
+                  {envBackupActionError ? (
                     <ApiErrorAlert
-                      error={desktopActionError}
-                      actionLabel={desktopActionError.status === 409 ? '重新加载' : undefined}
-                      onAction={desktopActionError.status === 409 ? () => void load() : undefined}
+                      error={envBackupActionError}
+                      actionLabel={envBackupActionError.status === 409 ? '重新加载' : undefined}
+                      onAction={envBackupActionError.status === 409 ? () => void load() : undefined}
                     />
                   ) : null}
-                  {!desktopActionError && desktopActionSuccess ? (
-                    <SettingsAlert title="操作成功" message={desktopActionSuccess} variant="success" />
+                  {!envBackupActionError && envBackupActionSuccess ? (
+                    <SettingsAlert title="操作成功" message={envBackupActionSuccess} variant="success" />
                   ) : null}
                 </div>
               </SettingsSectionCard>
@@ -658,35 +907,27 @@ const SettingsPage: React.FC = () => {
               <ChangePasswordCard />
             ) : null}
             {activeCategory === 'notification' ? (
-              <NotificationTestPanel
-                items={rawActiveItems.map((item) => ({ key: item.key, value: String(item.value ?? '') }))}
-                maskToken={maskToken}
-                disabled={isSaving || isLoading}
-              />
-            ) : null}
-            {activeItems.length ? (
-              <SettingsSectionCard
-                title="当前分类配置项"
-                description={getCategoryDescriptionZh(activeCategory as SystemConfigCategory, '') || '使用统一字段卡片维护当前分类的系统配置。'}
+              <SettingsPanelErrorBoundary
+                title="通知测试"
+                resetKey={`notification-test:${configVersion}`}
+                diagnosticHint={settingsPanelDiagnosticHint}
               >
-                {activeItems.map((item) => (
-                  <SettingsField
-                    key={item.key}
-                    item={item}
-                    value={item.value}
-                    disabled={isSaving}
-                    onChange={setDraftValue}
-                    issues={issueByKey[item.key] || []}
-                  />
-                ))}
-              </SettingsSectionCard>
-            ) : (
-              <EmptyState
-                title="当前分类下暂无配置项"
-                description="当前分类没有可编辑字段；可切换左侧分类继续查看其它系统配置。"
-                className="settings-surface-panel settings-border-strong border-none bg-transparent shadow-none"
-              />
-            )}
+                <NotificationTestPanel
+                  items={rawActiveItems.map((item) => ({ key: item.key, value: String(item.value ?? '') }))}
+                  maskToken={maskToken}
+                  disabled={isSaving || isLoading}
+                />
+              </SettingsPanelErrorBoundary>
+            ) : null}
+            {shouldGuardActiveConfigPanel && activeItems.length ? (
+              <SettingsPanelErrorBoundary
+                title={activeConfigPanelErrorTitle}
+                resetKey={`${activeCategory}:${configVersion}`}
+                diagnosticHint={settingsPanelDiagnosticHint}
+              >
+                {activeConfigPanel}
+              </SettingsPanelErrorBoundary>
+            ) : activeConfigPanel}
           </section>
         </div>
       )}
@@ -713,7 +954,7 @@ const SettingsPage: React.FC = () => {
         cancelText="取消"
         onConfirm={() => {
           setShowImportConfirm(false);
-          desktopImportRef.current?.click();
+          envBackupImportRef.current?.click();
         }}
         onCancel={() => {
           setShowImportConfirm(false);

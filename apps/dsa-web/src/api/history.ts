@@ -8,6 +8,7 @@ import type {
   NewsIntelResponse,
   NewsIntelItem,
   HistoryTrendResponse,
+  RunDiagnosticSummary,
 } from '../types/analysis';
 
 // ============ API 接口 ============
@@ -89,6 +90,15 @@ export const historyApi = {
       params: { stock_code: stockCode, days },
     });
     return toCamelCase<HistoryTrendResponse>(response.data);
+  },
+
+  /**
+   * 获取历史报告运行诊断摘要
+   * @param recordId 分析历史记录主键 ID
+   */
+  getDiagnostics: async (recordId: number): Promise<RunDiagnosticSummary> => {
+    const response = await apiClient.get<Record<string, unknown>>(`/api/v1/history/${recordId}/diagnostics`);
+    return toCamelCase<RunDiagnosticSummary>(response.data);
   },
 
   /**
