@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] `AkshareFetcher` 新增 `get_index_daily(symbol, start_date, end_date, include_today)`，在盘后历史日线接口未刷新当日数据时自动用新浪 spot 拼接当日 OHLCV，便于盘后做完整技术分析。
+- [新功能] `TushareFetcher` 新增 `get_index_daily`，复用 Pro `index_daily`/`rt_idx_k` 接口，输出口径（volume=股、amount=元）与 akshare 实现完全对齐；配置 `TUSHARE_TOKEN` 后由数据源管理器优先调用。
+- [新功能] `DataFetcherManager` 新增 `get_index_daily` 多源 fallback：按 priority 顺序依次询问各 fetcher，首选 Tushare（付费稳定）→ 失败/未配置自动降级 akshare，对调用方零感知。
+- [新功能] `index-analysis` skill 新增「上下沿（关键位汇总）」分析：MA/EMA/BOLL/近 N 日极值/当日 high-low/整数关口/Fibonacci 综合候选 + 强中弱分级 + 按距离裁剪 + 相近合并，输出 `resistance_levels` / `support_levels` / `immediate_resistance` / `immediate_support`。
+- [新功能] `index-analysis` skill 新增「顶背离 × 上下沿」联动评估，输出 高置信 / 中置信 / 无 三档反转置信，便于消费方一眼判断是否触发反转警惕。
+- [改进] `index-analysis` skill 数据源切换到 `DataFetcherManager.get_index_daily`，享 Tushare 优先 / 当日盘后实时拼接 / akshare 自动 fallback；CLI 新增 `--mode divergence/levels/both`、`--band-window`、`--band-limit`、`--near-pct`；默认指数从 sh,sz,cy,kc 改为 sh,sz,cy（kc 仍可手动加上）。
+- [新功能] `index-analysis` skill 新增每日 snapshot 历史持久化：默认调用时**自动保存当天结论并展示近 10 个交易日的关键位变化**（持续阻力位 / 关键转换识别），同一天再跑覆盖文件；存放 `skills/index-analysis/history/{YYYY-MM-DD}.json`（已 gitignore）；CLI 新增 `--history-days N`、`--no-history`、`--no-save`。
+- [改进] `index-analysis` skill 默认指数从 sh,sz,cy 改为 sh,sz,cy,kc（加入科创50）；不想看某个指数显式列出剩下的即可（如 `--indices sh,sz,cy`）。
+- [新功能] `index-analysis` skill 新增邮件推送：`--mode both` 跑完默认自动发邮件，正文 = 终端完整输出（Markdown 自动转 HTML），主题含日期 + 高置信反转数；复用 `src/notification_sender/email_sender.py`，配置环境变量 `EMAIL_SENDER/EMAIL_PASSWORD/EMAIL_RECEIVERS`（与仓库主流程一致）；CLI 新增 `--no-email` 关闭；未配置时静默跳过。
 - [改进] AlphaSift 选股入口在 Web 侧边栏中移动到“问股”下方，贴近 Agent/研究辅助工作流。
 - [改进] Docker 镜像构建阶段预置默认 AlphaSift 适配层，与桌面发布包一样避免运行期额外安装。
 - [新功能] 新增默认关闭的 AlphaSift 选股页签，通过 `ALPHASIFT_ENABLED` 开启后经由稳定适配层读取策略并执行选股。

@@ -85,3 +85,6 @@ static/
 /apps/dsa-desktop/dist/
 /apps/dsa-desktop/node_modules/
 docs/specs/
+
+# 个人复盘数据，不入库（index-analysis skill 每日 snapshot，同日覆盖）
+skills/index-analysis/history/

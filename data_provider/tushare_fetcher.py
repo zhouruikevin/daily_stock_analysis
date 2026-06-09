@@ -938,6 +938,136 @@ class TushareFetcher(BaseFetcher):
 
         return None
 
+    _INDEX_DAILY_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount']
+
+    # 常见指数代码到 Tushare ts_code 的硬映射，覆盖 akshare 风格输入；
+    # 未命中的代码再按交易所后缀推断。
+    _INDEX_TS_CODE_HARDMAP = {
+        'sh000001': '000001.SH', '000001.sh': '000001.SH',
+        'sh000016': '000016.SH', 'sh000300': '000300.SH', 'sh000688': '000688.SH',
+        'sh000905': '000905.SH', 'sh000852': '000852.SH',
+        'sz399001': '399001.SZ', 'sz399006': '399006.SZ', 'sz399303': '399303.SZ',
+    }
+
+    @classmethod
+    def _to_tushare_index_ts_code(cls, symbol: str) -> Optional[str]:
+        """
+        把 akshare 风格的指数代码（sh000001 / sz399006）转成 Tushare ts_code
+        （000001.SH / 399006.SZ）。已经是 ts_code 格式则原样返回。
+        """
+        if not symbol:
+            return None
+        raw = symbol.strip()
+        key = raw.lower()
+        if key in cls._INDEX_TS_CODE_HARDMAP:
+            return cls._INDEX_TS_CODE_HARDMAP[key]
+        # 已经是 ts_code 形式
+        if '.' in raw and raw.split('.')[-1].upper() in {'SH', 'SZ', 'BJ'}:
+            digits, suffix = raw.split('.')
+            return f"{digits}.{suffix.upper()}"
+        # 前缀形式 sh000001 / sz399001 / bj899050
+        prefix = key[:2]
+        if prefix in {'sh', 'sz', 'bj'} and key[2:].isdigit():
+            return f"{key[2:]}.{prefix.upper()}"
+        # 纯数字按上交所推断（000/6 开头 → SH，其它 → SZ）
+        if raw.isdigit():
+            suffix = 'SH' if raw.startswith(('000', '6')) else 'SZ'
+            return f"{raw}.{suffix}"
+        return None
+
+    def get_index_daily(
+        self,
+        symbol: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        include_today: bool = True,
+    ) -> Optional[pd.DataFrame]:
+        """
+        通过 Tushare Pro 获取指数历史日线，输出口径对齐 ``AkshareFetcher.get_index_daily``
+        （volume 单位=股、amount 单位=元）。详见 BaseFetcher.get_index_daily。
+        """
+        if self._api is None:
+            logger.debug("[Tushare] 未配置 token，get_index_daily 跳过")
+            return None
+
+        ts_code = self._to_tushare_index_ts_code(symbol)
+        if not ts_code:
+            logger.warning(f"[Tushare] 无法识别指数代码: {symbol}")
+            return None
+
+        # Tushare 用 YYYYMMDD，无 start 默认拉近 1 年，足够算 MA250
+        now_cn = self._get_china_now()
+        ts_end = (end_date or now_cn.strftime('%Y-%m-%d')).replace('-', '')
+        ts_start = (start_date or (now_cn - timedelta(days=400)).strftime('%Y-%m-%d')).replace('-', '')
+
+        try:
+            df = self._call_api_with_rate_limit(
+                "index_daily",
+                ts_code=ts_code,
+                start_date=ts_start,
+                end_date=ts_end,
+            )
+        except Exception as exc:
+            logger.error(f"[Tushare] 拉取指数 {ts_code} 日线失败: {exc}")
+            return None
+
+        if df is None or df.empty:
+            logger.warning(f"[Tushare] 指数 {ts_code} 日线为空")
+            return None
+
+        df = df.copy()
+        df['date'] = pd.to_datetime(df['trade_date'].astype(str)).dt.strftime('%Y-%m-%d')
+        # 单位对齐 akshare：vol=手→股(×100)、amount=千元→元(×1000)
+        df['volume'] = df['vol'].astype(float) * 100.0
+        df['amount'] = df['amount'].astype(float) * 1000.0
+        df = df[self._INDEX_DAILY_COLUMNS].sort_values('date').reset_index(drop=True)
+
+        # 历史接口已含今天（付费收盘后通常 17:00+ 就有）就不再拼 rt_idx_k
+        today_str = now_cn.strftime('%Y-%m-%d')
+        if include_today and df['date'].iloc[-1] < today_str:
+            today_row = self._fetch_index_today_rt(ts_code, today_str)
+            if today_row is not None:
+                df = pd.concat([df, pd.DataFrame([today_row])], ignore_index=True)
+
+        return df.reset_index(drop=True) if not df.empty else None
+
+    def _fetch_index_today_rt(self, ts_code: str, today_str: str) -> Optional[Dict[str, Any]]:
+        """
+        用 rt_idx_k 接口取当日指数 K 线（需 Tushare 单独权限，一般 5000+ 积分）。
+        权限不足或失败时返回 None，由上层决定是否回退到其它源。
+        """
+        try:
+            df = self._call_api_with_rate_limit("rt_idx_k", ts_code=ts_code)
+        except AttributeError:
+            logger.debug("[Tushare] rt_idx_k 接口不可用（当前 client 不支持）")
+            return None
+        except Exception as exc:
+            logger.debug(f"[Tushare] rt_idx_k 拼接当日失败: {exc}")
+            return None
+
+        if df is None or df.empty:
+            return None
+        row = df[df['ts_code'] == ts_code]
+        if row.empty:
+            return None
+        row = row.iloc[0]
+
+        open_px = float(row.get('open') or 0)
+        high = float(row.get('high') or 0)
+        low = float(row.get('low') or 0)
+        close = float(row.get('close') or 0)
+        if max(open_px, high, low, close) <= 0:
+            return None
+        return {
+            'date': today_str,
+            'open': open_px,
+            'high': high,
+            'low': low,
+            'close': close,
+            'volume': float(row.get('vol') or 0) * 100.0,
+            'amount': float(row.get('amount') or 0) * 1000.0,
+        }
+
     def get_market_stats(self) -> Optional[dict]:
         """
         获取市场涨跌统计 (Tushare Pro)

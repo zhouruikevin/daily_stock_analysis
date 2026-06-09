@@ -12,6 +12,7 @@ A股自选股智能分析系统 - 分析服务层
 """
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
 from src.analyzer import AnalysisResult
@@ -91,10 +92,11 @@ def analyze_stocks(
     config: Config = None,
     full_report: bool = False,
     notifier: Optional[NotificationService] = None,
-    merge_notification: bool = True
+    merge_notification: bool = True,
+    max_workers: Optional[int] = None
 ) -> List[AnalysisResult]:
     """
-    分析多只股票
+    分析多只股票（支持多线程并发）
 
     Args:
         stock_codes: 股票代码列表
@@ -102,6 +104,7 @@ def analyze_stocks(
         full_report: 是否生成完整报告
         notifier: 通知服务（可选，默认自动检测邮件配置）
         merge_notification: 是否合并通知为一封邮件（默认 True）
+        max_workers: 最大并发线程数（可选，默认从配置读取，一般为3）
 
     Returns:
         分析结果列表
@@ -113,18 +116,49 @@ def analyze_stocks(
     if notifier is None:
         notifier = _get_default_notifier()
 
+    # 确定并发数
+    if max_workers is None:
+        max_workers = getattr(config, 'max_workers', 3)
+
     report_type = ReportType.FULL if full_report else ReportType.SIMPLE
     results = []
 
-    # 批量分析时不逐只发送通知,最后统一合并发送
-    for stock_code in stock_codes:
-        result = analyze_stock(
-            stock_code, config, full_report,
-            notifier=None,
-            _no_auto_notify=True  # 禁用自动创建 notifier
-        )
-        if result:
-            results.append(result)
+    if max_workers > 1 and len(stock_codes) > 1:
+        # 多线程并发分析
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"批量分析启动: {len(stock_codes)} 只股票, {max_workers} 线程并发")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_code = {
+                executor.submit(
+                    analyze_stock,
+                    stock_code, config, full_report,
+                    notifier=None,
+                    _no_auto_notify=True
+                ): stock_code
+                for stock_code in stock_codes
+            }
+
+            for future in as_completed(future_to_code):
+                code = future_to_code[future]
+                try:
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(f"分析 {code} 失败: {e}")
+    else:
+        # 单线程串行分析
+        for stock_code in stock_codes:
+            result = analyze_stock(
+                stock_code, config, full_report,
+                notifier=None,
+                _no_auto_notify=True
+            )
+            if result:
+                results.append(result)
 
     # 合并通知: 所有股票分析完成后,生成汇总报告一次性发送
     if merge_notification and notifier and results:

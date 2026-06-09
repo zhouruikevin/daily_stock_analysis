@@ -346,6 +346,32 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_index_daily(
+        self,
+        symbol: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        include_today: bool = True,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取指数历史日线，可选拼接当日盘后快照。
+
+        Why: 指数历史日线接口（如新浪 stock_zh_index_daily）通常要等到当晚 20:00 之后
+        才补当日 K 线，盘后做技术分析时会缺最新一根。include_today=True 时用实时 spot
+        快照（开高低收 + 成交量/成交额）拼一根伪日线接到末尾，盘后即可拿到完整序列。
+
+        Args:
+            symbol: 指数代码，例如 ``sh000001``、``sz399001``
+            start_date: 起始日期 ``YYYY-MM-DD``，None 表示不裁剪
+            end_date: 结束日期 ``YYYY-MM-DD``，None 表示到最新
+            include_today: 是否在末尾拼接当日 spot 数据；若 spot 失败仅日志告警，不抛错
+
+        Returns:
+            DataFrame，列 ``['date', 'open', 'high', 'low', 'close', 'volume', 'amount']``，
+            date 为 ``YYYY-MM-DD`` 字符串，按时间升序；数据源不可用时返回 None。
+        """
+        return None
+
     def get_market_stats(self) -> Optional[Dict[str, Any]]:
         """
         获取市场涨跌统计
@@ -2128,6 +2154,35 @@ class DataFetcherManager:
                 logger.warning(f"[{fetcher.name}] 获取指数行情失败: {e}")
                 continue
         return []
+
+    def get_index_daily(
+        self,
+        symbol: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        include_today: bool = True,
+    ) -> Optional[pd.DataFrame]:
+        """按优先级遍历 fetchers 调用 get_index_daily，第一个返回非空结果即采用。
+
+        Why: 付费 Tushare 没被风控时优先用，挂了/未配置自动降级到 akshare，
+        让上层一行调用就能拿到完整的指数日线（含当日盘后拼接）。
+        """
+        for fetcher in self._get_fetchers_snapshot():
+            try:
+                df = fetcher.get_index_daily(
+                    symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    include_today=include_today,
+                )
+            except Exception as exc:
+                logger.warning(f"[{fetcher.name}] get_index_daily({symbol}) 失败: {exc}")
+                continue
+            if df is not None and not df.empty:
+                logger.info(f"[{fetcher.name}] 指数 {symbol} 日线获取成功 ({len(df)} 行)")
+                return df
+        logger.warning(f"[Manager] 所有数据源都未能拿到指数 {symbol} 日线")
+        return None
 
     def get_index_change_pct(self, index_codes: Optional[List[str]] = None) -> Dict[str, Optional[float]]:
         """获取指定指数的当日涨跌幅（轻量接口）。

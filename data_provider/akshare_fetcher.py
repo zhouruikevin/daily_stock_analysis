@@ -1750,6 +1750,108 @@ class AkshareFetcher(BaseFetcher):
             logger.error(f"[Akshare] 获取指数行情失败: {e}")
             return None
 
+    _INDEX_DAILY_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount']
+
+    def get_index_daily(
+        self,
+        symbol: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        include_today: bool = True,
+    ) -> Optional[pd.DataFrame]:
+        """获取指数历史日线，可选拼接当日 spot 快照。详见 BaseFetcher.get_index_daily。"""
+        import akshare as ak
+
+        if not symbol:
+            logger.warning("[Akshare] get_index_daily 需要 symbol")
+            return None
+
+        # ---- 历史日线（stock_zh_index_daily：date/open/close/high/low/volume）----
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        try:
+            hist = _akshare_call_with_timeout(
+                ak.stock_zh_index_daily,
+                symbol=symbol,
+                timeout=self._history_call_timeout,
+                call_name=f"index_daily:{symbol}",
+            )
+        except Exception as exc:
+            logger.error(f"[Akshare] 拉取指数 {symbol} 历史日线失败: {exc}")
+            return None
+
+        if hist is None or hist.empty:
+            logger.warning(f"[Akshare] 指数 {symbol} 历史日线为空")
+            return None
+
+        df = hist.copy()
+        df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+        # 历史接口无 amount 字段，先占位，便于拼接
+        if 'amount' not in df.columns:
+            df['amount'] = 0.0
+        df = df[self._INDEX_DAILY_COLUMNS].sort_values('date').reset_index(drop=True)
+
+        # ---- 拼接当日 spot（盘后历史接口未更新时补最新一根）----
+        if include_today:
+            try:
+                today_row = self._fetch_index_today_spot(symbol)
+            except Exception as exc:
+                # spot 失败不影响主流程，只丢失「今日」这一根
+                logger.warning(f"[Akshare] 指数 {symbol} 今日 spot 拼接失败，仅返回历史: {exc}")
+                today_row = None
+
+            if today_row is not None and today_row['date'] > df['date'].iloc[-1]:
+                df = pd.concat([df, pd.DataFrame([today_row])], ignore_index=True)
+
+        # ---- 按 start_date / end_date 裁剪 ----
+        if start_date:
+            df = df[df['date'] >= start_date]
+        if end_date:
+            df = df[df['date'] <= end_date]
+
+        return df.reset_index(drop=True) if not df.empty else None
+
+    def _fetch_index_today_spot(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """从新浪 spot 接口取指定指数当日 OHLCV，失败时返回 None。"""
+        import akshare as ak
+
+        self._set_random_user_agent()
+        self._enforce_rate_limit()
+        spot_df = ak.stock_zh_index_spot_sina()
+        if spot_df is None or spot_df.empty or '代码' not in spot_df.columns:
+            return None
+
+        row = spot_df[spot_df['代码'] == symbol]
+        if row.empty:
+            row = spot_df[spot_df['代码'].astype(str).str.contains(symbol, na=False)]
+        if row.empty:
+            return None
+        row = row.iloc[0]
+
+        # spot 接口没有显式日期字段，按本地交易日（A 股北京时间）取
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        open_px = safe_float(row.get('今开', 0))
+        high = safe_float(row.get('最高', 0))
+        low = safe_float(row.get('最低', 0))
+        close = safe_float(row.get('最新价', 0))
+        # 没有任何有效价格说明 spot 未开盘或字段异常
+        if max(open_px, high, low, close) <= 0:
+            return None
+
+        # 单位对齐：stock_zh_index_daily 的 volume 单位是「股」，
+        # 而 stock_zh_index_spot_sina 的「成交量」单位是「手」(=100 股)，
+        # 直接拼接会让最新一根成交量比相邻日小 100 倍，破坏量能指标。
+        return {
+            'date': today,
+            'open': open_px,
+            'high': high,
+            'low': low,
+            'close': close,
+            'volume': safe_float(row.get('成交量', 0)) * 100,
+            'amount': safe_float(row.get('成交额', 0)),
+        }
+
     def get_market_stats(self) -> Optional[Dict[str, Any]]:
         """
         获取市场涨跌统计
