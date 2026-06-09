@@ -55,6 +55,7 @@ def _sample_wrapped(index_key: str = "sh",
             "confidence": confidence,
             "reason": "顶背离+价格距上沿 0.03%" if confidence == "高置信" else "无",
             "distance_to_resistance_pct": 0.03 if confidence == "高置信" else None,
+            "divergence_score": 35 if confidence == "高置信" else None,
         },
     }
 
@@ -227,3 +228,29 @@ def test_format_history_table_filters_by_index_keys():
     out = h.format_history_table([snap], index_keys=["sh"])
     assert "上证指数" in out
     assert "创业板指" not in out
+
+
+def test_build_index_snapshot_includes_divergence_score():
+    """snapshot 应包含 divergence_score 字段"""
+    snap = h.build_index_snapshot(_sample_wrapped())
+    assert "divergence_score" in snap
+    assert snap["divergence_score"] == 35
+
+
+def test_build_index_snapshot_divergence_score_none_when_missing():
+    """reversal 中无 divergence_score 时 snapshot 应为 None"""
+    wrapped = _sample_wrapped()
+    del wrapped["reversal"]["divergence_score"]
+    snap = h.build_index_snapshot(wrapped)
+    assert snap["divergence_score"] is None
+
+
+def test_format_history_table_shows_score_column():
+    """历史表应包含评分列"""
+    snaps = [
+        h.build_daily_snapshot([_sample_wrapped()], today="2026-06-04"),
+        h.build_daily_snapshot([_sample_wrapped()], today="2026-06-05"),
+    ]
+    out = h.format_history_table(snaps)
+    assert "评分" in out
+    assert "35分" in out

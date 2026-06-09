@@ -51,9 +51,23 @@ def _count_high_confidence(results: List[Dict[str, Any]]) -> int:
     return n
 
 
+def _max_score(results: List[Dict[str, Any]]) -> tuple:
+    """返回 (最高评分, 对应指数名称)，无评分时返回 (None, None)。"""
+    best_score = None
+    best_name = None
+    for w in results:
+        rev = w.get("reversal") or {}
+        div = w.get("divergence") or {}
+        score = rev.get("divergence_score", div.get("divergence_score"))
+        if score is not None and (best_score is None or score > best_score):
+            best_score = score
+            best_name = div.get("index_name", w.get("index_key", "?"))
+    return best_score, best_name
+
+
 def build_subject(results: List[Dict[str, Any]],
                   today: Optional[str] = None) -> str:
-    """主题示例：📊 指数分析 - 2026-06-05 - ⚠️ 3/4 高置信反转
+    """主题示例：📊 指数分析 - 2026-06-05 - ⚠️ 3/4 高置信反转 - 创业板 100分(高风险)
 
     高置信数为 0 时去掉警报标志，避免 inbox 视觉污染。
     """
@@ -63,9 +77,24 @@ def build_subject(results: List[Dict[str, Any]],
     high = _count_high_confidence(results)
     if total == 0:
         return f"📊 指数分析 - {today}"
+    # 最高评分后缀
+    best_score, best_name = _max_score(results)
+    score_suffix = ""
+    if best_score is not None:
+        # 简易风险等级
+        if best_score >= 70:
+            level = "高风险"
+        elif best_score >= 45:
+            level = "中风险"
+        elif best_score >= 15:
+            level = "低风险"
+        else:
+            level = "无信号"
+        score_suffix = f" - {best_name} {best_score}分({level})"
+
     if high == 0:
-        return f"📊 指数分析 - {today} - 无高置信信号 ({total} 指数)"
-    return f"📊 指数分析 - {today} - ⚠️ {high}/{total} 高置信反转"
+        return f"📊 指数分析 - {today} - 无高置信信号 ({total} 指数){score_suffix}"
+    return f"📊 指数分析 - {today} - ⚠️ {high}/{total} 高置信反转{score_suffix}"
 
 
 def send_analysis_email(content: str,

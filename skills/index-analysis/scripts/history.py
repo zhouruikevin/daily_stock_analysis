@@ -86,6 +86,7 @@ def build_index_snapshot(wrapped: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "reversal_confidence": rev.get("confidence"),
         "reversal_reason": rev.get("reason"),
         "distance_to_resistance_pct": rev.get("distance_to_resistance_pct"),
+        "divergence_score": rev.get("divergence_score"),
     }
 
 
@@ -232,9 +233,10 @@ def format_history_table(snapshots: List[Dict[str, Any]],
             continue
         name = series[-1].get("index_name", k)
         lines.append(f"\n  ===== {name} =====")
-        lines.append(f"  {'日期':<12} {'当前价':<10} {'立即阻力':<10} "
+        lines.append(f"  {'日期':<12} {'当前价':<10} {'评分':<14} {'立即阻力':<10} "
                      f"{'阻力 label':<28} {'距阻力':<7} {'反转置信':<8}")
-        lines.append(f"  {'-'*88}")
+        lines.append(f"  {'-'*102}")
+        _prev_score = None
         for day in series:
             ir = day.get("immediate_resistance")
             ir_str = f"{ir:g}" if ir is not None else "-"
@@ -245,8 +247,19 @@ def format_history_table(snapshots: List[Dict[str, Any]],
             dist_str = f"{dist:.2f}%" if dist is not None else "-"
             cp = day.get("current_price")
             cp_str = f"{cp:g}" if cp is not None else "-"
+            # 评分列
+            sc = day.get("divergence_score")
+            if sc is not None:
+                change = ""
+                if _prev_score is not None:
+                    diff = sc - _prev_score
+                    change = f"({diff:+d})" if diff else "(=)"
+                score_str = f"{sc}分{change}"
+                _prev_score = sc
+            else:
+                score_str = "-"
             lines.append(
-                f"  {day['date']:<12} {cp_str:<10} {ir_str:<10} "
+                f"  {day['date']:<12} {cp_str:<10} {score_str:<14} {ir_str:<10} "
                 f"{ir_label[:26]:<28} {dist_str:<7} "
                 f"{day.get('reversal_confidence', '?'):<8}"
             )

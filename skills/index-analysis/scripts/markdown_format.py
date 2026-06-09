@@ -33,6 +33,19 @@ _STRENGTH_ICON = {
 }
 
 
+def _score_emoji(score: int | None) -> str:
+    """评分对应的 emoji。"""
+    if score is None:
+        return ""
+    if score >= 70:
+        return "🔴"
+    if score >= 45:
+        return "🟠"
+    if score >= 15:
+        return "🟡"
+    return "⚪"
+
+
 # ============================================================
 # 单指数详情
 # ============================================================
@@ -199,7 +212,11 @@ def _format_index_reversal_md(rev: Dict[str, Any], index_name: str) -> str:
     confidence = rev.get("confidence", "?")
     reason = rev.get("reason", "")
     emoji = _CONFIDENCE_EMOJI.get(confidence, "")
-    return f"**反转置信**：{emoji} **{confidence}** — {reason}"
+    score = rev.get("divergence_score")
+    score_part = ""
+    if score is not None:
+        score_part = f" ｜ 评分：{_score_emoji(score)} **{score}分**"
+    return f"**反转置信**：{emoji} **{confidence}** — {reason}{score_part}"
 
 
 # ============================================================
@@ -238,8 +255,8 @@ def _format_combined_summary_md(results: List[Dict[str, Any]]) -> str:
     lines: List[str] = []
     lines.append("## 联动总览")
     lines.append("")
-    lines.append("| 指数 | 背离 | 当前价 | 立即阻力 | 距阻力 | 立即支撑 | 反转置信 |")
-    lines.append("|------|------|--------|----------|--------|----------|----------|")
+    lines.append("| 指数 | 背离 | 当前价 | 立即阻力 | 距阻力 | 立即支撑 | 评分 | 反转置信 |")
+    lines.append("|------|------|--------|----------|--------|----------|------|----------|")
 
     for w in results:
         div = w.get("divergence") or {}
@@ -261,10 +278,12 @@ def _format_combined_summary_md(results: List[Dict[str, Any]]) -> str:
         is_str = f"{is_val:g}" if is_val is not None else "-"
         confidence = rev.get("confidence", "?")
         emoji = _CONFIDENCE_EMOJI.get(confidence, "")
+        score = rev.get("divergence_score", div.get("divergence_score"))
+        score_str = f"{_score_emoji(score)} {score}" if score is not None else "-"
 
         lines.append(
             f"| {name} | {sev} | {cp} | {ir_str} | {dist_str} | {is_str} "
-            f"| {emoji} {confidence} |"
+            f"| {score_str} | {emoji} {confidence} |"
         )
 
     lines.append("")

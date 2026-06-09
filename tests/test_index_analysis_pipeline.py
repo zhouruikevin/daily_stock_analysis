@@ -164,3 +164,56 @@ def test_analyze_levels_passes_band_args_to_compute(monkeypatch):
     # 截断到 2 条以内
     assert len(result["resistance_levels"]) <= 2
     assert len(result["support_levels"]) <= 2
+
+
+# ============================================================
+# compute_divergence_score: 评分纯函数
+# ============================================================
+def test_score_zero_when_no_divergence():
+    """无任何背离 → 评分 0"""
+    assert ind.compute_divergence_score(False, False, False, "无") == 0
+
+
+def test_score_macd_only():
+    """仅 MACD 顶背离，severity=中 → 40"""
+    assert ind.compute_divergence_score(True, False, False, "中") == 40
+
+
+def test_score_strong_dual_divergence():
+    """MACD+RSI 双重背离，severity=强 → 40+30+15=85"""
+    assert ind.compute_divergence_score(True, True, False, "强") == 85
+
+
+def test_score_all_divergence_with_high_confidence():
+    """三重背离 + 共振 + 高置信微调 → 100 (cap)"""
+    raw = 40 + 30 + 15 + 15  # =100
+    assert ind.compute_divergence_score(True, True, True, "强", "高置信") == 100
+
+
+def test_score_no_confidence_penalty():
+    """RSI+量价背离，severity=强，反转置信=无 → 30+15+15-5=55"""
+    assert ind.compute_divergence_score(False, True, True, "强", "无") == 55
+
+
+def test_score_to_level_mapping():
+    """评分 → 风险等级映射"""
+    assert ind.score_to_level(0) == "无信号"
+    assert ind.score_to_level(14) == "无信号"
+    assert ind.score_to_level(15) == "低风险"
+    assert ind.score_to_level(44) == "低风险"
+    assert ind.score_to_level(45) == "中风险"
+    assert ind.score_to_level(69) == "中风险"
+    assert ind.score_to_level(70) == "高风险"
+    assert ind.score_to_level(100) == "高风险"
+
+
+def test_assess_reversal_includes_divergence_score():
+    """assess_reversal 返回 dict 应包含 divergence_score 字段"""
+    div = _div(macd=True, rsi=True)
+    div["vol_divergence"] = True
+    div["divergence_severity"] = "强"
+    lev = _lev(current=4057.78, immediate_r=4070.0)
+    rev = ind.assess_reversal(div, lev, near_pct=0.5)
+    assert "divergence_score" in rev
+    # MACD(40)+RSI(30)+VOL(15)+共振(15)+高置信(+5) = 100(capped)
+    assert rev["divergence_score"] == 100

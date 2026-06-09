@@ -388,6 +388,9 @@ def analyze_divergence(
         "dif_peaks": dif_peak_details,
         "rsi_peaks": rsi_peak_details,
         "current_state": current_state,
+        "divergence_score": compute_divergence_score(
+            macd_divergence, rsi_divergence, vol_divergence, severity
+        ),
         "daily_data": daily_data,
     }
 
@@ -463,12 +466,86 @@ def assess_reversal(div: dict, lev: dict, near_pct: float = 0.5) -> dict:
     else:
         confidence = "无"
         reason = "无顶背离信号"
+    final_score = compute_divergence_score(
+        bool(div.get("macd_divergence")),
+        bool(div.get("rsi_divergence")),
+        bool(div.get("vol_divergence")),
+        div.get("divergence_severity", "无"),
+        reversal_confidence=confidence,
+    )
     return {
         "confidence": confidence,
         "reason": reason,
         "distance_to_resistance_pct": (round(distance_pct, 2)
                                        if distance_pct is not None else None),
+        "divergence_score": final_score,
     }
+
+
+# ============================================================
+# 顶背离评分
+# ============================================================
+_DIVERGENCE_WEIGHTS = {
+    "macd": 40,       # 中期动能衰竭，最可靠
+    "rsi": 30,        # 短期力度衰减，先行指标
+    "vol": 15,        # 参与度下降，弱信号
+    "resonance": 15,  # 多指标共振加成 (severity=强)
+}
+# 权重和=100，score 自然是 0-100，无需归一化
+
+_SCORE_LEVELS = [
+    (70, "高风险"),
+    (45, "中风险"),
+    (15, "低风险"),
+    (0, "无信号"),
+]
+
+
+def compute_divergence_score(
+    macd_div: bool,
+    rsi_div: bool,
+    vol_div: bool,
+    severity: str,
+    reversal_confidence: str = "",
+) -> int:
+    """计算顶背离评分 (0-100)。
+
+    原始分 = Σ(命中指标权重) + 共振加成
+    最终分 = 原始分 ± 反转置信微调 (cap 100, floor 0)
+
+    Args:
+        macd_div: MACD 顶背离是否成立
+        rsi_div: RSI 顶背离是否成立
+        vol_div: 量价背离是否成立
+        severity: 背离信号强度 (强/中/弱/无)
+        reversal_confidence: 反转置信 (高置信/中置信/无)，空字符串跳过微调
+
+    Returns:
+        0-100 整数评分
+    """
+    score = 0
+    if macd_div:
+        score += _DIVERGENCE_WEIGHTS["macd"]
+    if rsi_div:
+        score += _DIVERGENCE_WEIGHTS["rsi"]
+    if vol_div:
+        score += _DIVERGENCE_WEIGHTS["vol"]
+    if severity == "强":
+        score += _DIVERGENCE_WEIGHTS["resonance"]
+    # 反转置信微调
+    if reversal_confidence == "高置信":
+        score = min(100, score + 5)
+    elif reversal_confidence == "无":
+        score = max(0, score - 5)
+    return score
+
+
+def score_to_level(score: int) -> str:
+    """评分 → 风险等级映射。"""
+    for threshold, label in _SCORE_LEVELS:
+        if score >= threshold:
+            return label
+    return "无信号"
 
 
 # ============================================================
@@ -650,10 +727,10 @@ def format_combined_summary(wrapped_results: list) -> str:
         vals = [f"{lv['value']:g}" for lv in levels[:n]]
         return " / ".join(vals)
 
-    lines.append(f"  {'指数':<8} {'背离':<6} {'当前价':<10} "
+    lines.append(f"  {'指数':<8} {'评分':<12} {'背离':<6} {'当前价':<10} "
                  f"{'上沿 top3':<32} {'距阻力':<7} "
                  f"{'下沿 top3':<32} {'反转置信':<8}")
-    lines.append(f"  {'-'*108}")
+    lines.append(f"  {'-'*120}")
     for w in wrapped_results:
         div = w.get("divergence") or {}
         lev = w.get("levels") or {}
@@ -663,10 +740,14 @@ def format_combined_summary(wrapped_results: list) -> str:
             lines.append(f"  {w.get('index_key', '?'):<8} ERROR  {err}")
             continue
         sev = div.get("divergence_severity", "?")
+        score = rev.get("divergence_score", div.get("divergence_score"))
+        level = score_to_level(score) if score is not None else "?"
+        score_str = f"{score}分({level})" if score is not None else "-"
         dist = rev.get("distance_to_resistance_pct")
         dist_str = f"{dist:.2f}%" if dist is not None else "-"
         lines.append(
             f"  {div.get('index_name', w.get('index_key', '?')):<8} "
+            f"{score_str:<12} "
             f"{sev:<6} "
             f"{lev.get('current_price', '?'):<10} "
             f"{_topn(lev.get('resistance_levels', []), 3):<32} "
