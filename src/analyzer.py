@@ -27,6 +27,7 @@ from src.agent.llm_adapter import (
     resolve_fallback_litellm_wire_models,
     register_fallback_model_pricing,
 )
+from src.agent.provider_trace import resolved_model_provider_identity
 from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_ZH
 from src.config import (
     Config,
@@ -40,6 +41,12 @@ from src.config import (
 )
 from src.llm.generation_params import apply_litellm_generation_params
 from src.llm.errors import call_litellm_with_param_recovery
+from src.llm.usage import (
+    attach_legacy_message_stability_audit,
+    attach_message_hmacs,
+    extract_usage_payload,
+    normalize_litellm_usage,
+)
 from src.storage import persist_llm_usage
 from src.data.stock_mapping import STOCK_NAME_MAP
 from src.report_language import (
@@ -54,8 +61,10 @@ from src.report_language import (
     localize_confidence_level,
     normalize_report_language,
 )
+from src.schemas.decision_action import build_action_fields
 from src.schemas.report_schema import AnalysisReportSchema
-from src.market_context import get_market_role, get_market_guidelines
+from src.market_context import detect_market, get_market_role, get_market_guidelines
+from src.services.daily_market_context import format_daily_market_context_prompt_section
 from src.market_phase_prompt import format_market_phase_prompt_section
 
 logger = logging.getLogger(__name__)
@@ -156,6 +165,50 @@ def _should_hide_regular_session_ohlc(context: Dict[str, Any]) -> bool:
     )
 
 
+def _legacy_market_group(stock_code: Any) -> str:
+    code = str(stock_code or "").strip()
+    if not code or code.lower() == "unknown":
+        return "unknown"
+    market = detect_market(code)
+    return market if market in {"cn", "hk", "us"} else "unknown"
+
+
+def _legacy_audit_marker_specs(
+    context: Dict[str, Any],
+    *,
+    code: str,
+    stock_name: str,
+    report_language: str,
+    news_context: Optional[str],
+    analysis_context_pack_summary: Optional[str],
+) -> List[Dict[str, Any]]:
+    markers: List[Dict[str, Any]] = []
+
+    def add(marker_name: str, value: Any) -> None:
+        if value is None:
+            return
+        text = str(value).strip()
+        if not text:
+            return
+        markers.append(
+            {
+                "marker_name": marker_name,
+                "message_role": "user",
+                "text": text,
+            }
+        )
+
+    add("stock_code", code)
+    add("stock_name", stock_name)
+    add("analysis_date", context.get("date"))
+    add("market_phase", "## Market Phase Context" if report_language == "en" else "## 市场阶段上下文")
+    add("daily_market_context", "## Daily Market Context" if report_language == "en" else "## 大盘环境摘要")
+    add("analysis_context_pack", analysis_context_pack_summary)
+    add("quote", "## 📈 技术面数据")
+    add("news_context", "## 📰 舆情情报" if news_context else None)
+    return markers
+
+
 class _LiteLLMStreamError(RuntimeError):
     """Internal error wrapper that records whether any text was streamed."""
 
@@ -192,7 +245,11 @@ class _AllModelsFailedError(Exception):
         self.last_usage = last_usage or {}
 
 
-def check_content_integrity(result: "AnalysisResult") -> Tuple[bool, List[str]]:
+def check_content_integrity(
+    result: "AnalysisResult",
+    *,
+    require_phase_decision: bool = False,
+) -> Tuple[bool, List[str]]:
     """
     Check mandatory fields for report content integrity.
     Returns (pass, missing_fields). Module-level for use by pipeline (agent weak mode).
@@ -243,6 +300,23 @@ def check_content_integrity(result: "AnalysisResult") -> Tuple[bool, List[str]]:
         stop_loss = sp.get("stop_loss")
         if _is_invalid_stop_loss(stop_loss):
             missing.append("dashboard.battle_plan.sniper_points.stop_loss")
+    if require_phase_decision:
+        phase_decision = dash.get("phase_decision")
+        phase_decision = phase_decision if isinstance(phase_decision, dict) else {}
+        if not isinstance(phase_decision.get("phase_context"), dict):
+            missing.append("dashboard.phase_decision.phase_context")
+        if _is_blank_text(phase_decision.get("action_window")):
+            missing.append("dashboard.phase_decision.action_window")
+        if _is_blank_text(phase_decision.get("immediate_action")):
+            missing.append("dashboard.phase_decision.immediate_action")
+        if not isinstance(phase_decision.get("watch_conditions"), list):
+            missing.append("dashboard.phase_decision.watch_conditions")
+        if _is_blank_text(phase_decision.get("next_check_time")):
+            missing.append("dashboard.phase_decision.next_check_time")
+        if _is_blank_text(phase_decision.get("confidence_reason")):
+            missing.append("dashboard.phase_decision.confidence_reason")
+        if not isinstance(phase_decision.get("data_limitations"), list):
+            missing.append("dashboard.phase_decision.data_limitations")
     return len(missing) == 0, missing
 
 
@@ -268,7 +342,30 @@ def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) 
             return not value.strip()
         return False
 
-    placeholder = get_placeholder_text(getattr(result, "report_language", "zh"))
+    report_language = normalize_report_language(getattr(result, "report_language", "zh"))
+    placeholder = get_placeholder_text(report_language)
+    phase_decision_placeholders = {
+        "dashboard.phase_decision.action_window": (
+            "Model did not provide a phase action window"
+            if report_language == "en"
+            else "模型未提供阶段化行动窗口"
+        ),
+        "dashboard.phase_decision.immediate_action": (
+            "Model did not provide a phase-aware immediate action"
+            if report_language == "en"
+            else "模型未提供阶段化即时动作"
+        ),
+        "dashboard.phase_decision.next_check_time": (
+            "Model did not provide a next check point"
+            if report_language == "en"
+            else "模型未提供下一次检查点"
+        ),
+        "dashboard.phase_decision.confidence_reason": (
+            "Model did not provide a phase confidence rationale"
+            if report_language == "en"
+            else "模型未提供阶段化置信度理由"
+        ),
+    }
     for field in missing_fields:
         if field == "sentiment_score":
             result.sentiment_score = 50
@@ -315,6 +412,25 @@ def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) 
                 battle_plan["sniper_points"] = sniper_points
             if _is_invalid_stop_loss(sniper_points.get("stop_loss")):
                 sniper_points["stop_loss"] = placeholder
+        elif field.startswith("dashboard.phase_decision."):
+            if not result.dashboard:
+                result.dashboard = {}
+            phase_decision = result.dashboard.get("phase_decision")
+            if not isinstance(phase_decision, dict):
+                phase_decision = {}
+                result.dashboard["phase_decision"] = phase_decision
+            if field == "dashboard.phase_decision.phase_context":
+                if not isinstance(phase_decision.get("phase_context"), dict):
+                    phase_decision["phase_context"] = {}
+            elif field == "dashboard.phase_decision.watch_conditions":
+                if not isinstance(phase_decision.get("watch_conditions"), list):
+                    phase_decision["watch_conditions"] = []
+            elif field == "dashboard.phase_decision.data_limitations":
+                if not isinstance(phase_decision.get("data_limitations"), list):
+                    phase_decision["data_limitations"] = []
+            elif field in phase_decision_placeholders:
+                if _is_blank_text(phase_decision.get(field.rsplit(".", 1)[-1])):
+                    phase_decision[field.rsplit(".", 1)[-1]] = phase_decision_placeholders[field]
 
 
 # ---------- chip_structure fallback (Issue #589) ----------
@@ -1442,6 +1558,8 @@ class AnalysisResult:
     decision_type: str = "hold"  # 决策类型：buy/hold/sell（用于统计）
     confidence_level: str = "中"  # 置信度：高/中/低
     report_language: str = "zh"  # 报告输出语言：zh/en
+    action: Optional[str] = None  # 建议动作 taxonomy：buy/add/hold/reduce/sell/watch/avoid/alert
+    action_label: Optional[str] = None  # 本地化建议动作标签
 
     # ========== 决策仪表盘 (新增) ==========
     dashboard: Optional[Dict[str, Any]] = None  # 完整的决策仪表盘数据
@@ -1505,6 +1623,8 @@ class AnalysisResult:
             'decision_type': self.decision_type,
             'confidence_level': self.confidence_level,
             'report_language': self.report_language,
+            'action': self.action,
+            'action_label': self.action_label,
             'dashboard': self.dashboard,  # 决策仪表盘数据
             'trend_analysis': self.trend_analysis,
             'short_term_outlook': self.short_term_outlook,
@@ -1585,6 +1705,30 @@ class AnalysisResult:
             "low": "⭐",
         }
         return star_map.get(str(self.confidence_level or "").strip().lower(), "⭐⭐")
+
+
+def populate_decision_action_fields(
+    result: AnalysisResult,
+    *,
+    explicit_action: Any = None,
+    report_type: Any = None,
+    use_existing_action: bool = True,
+) -> AnalysisResult:
+    """Populate optional decision action fields without changing legacy advice."""
+
+    action_source = explicit_action
+    if action_source is None and use_existing_action:
+        action_source = getattr(result, "action", None)
+
+    fields = build_action_fields(
+        operation_advice=getattr(result, "operation_advice", None),
+        explicit_action=action_source,
+        report_type=report_type,
+        report_language=getattr(result, "report_language", "zh"),
+    )
+    result.action = fields["action"]
+    result.action_label = fields["action_label"]
+    return result
 
 
 class GeminiAnalyzer:
@@ -1696,6 +1840,16 @@ class GeminiAnalyzer:
                 "✅/⚠️/❌ 检查项5：筹码健康",
                 "✅/⚠️/❌ 检查项6：PE估值合理"
             ]
+        },
+
+        "phase_decision": {
+            "phase_context": {"phase": "premarket/intraday/lunch_break/closing_auction/postmarket/non_trading/unknown"},
+            "action_window": "盘前计划/盘中跟踪/午间确认/收盘前风控/盘后复盘/非交易日观察",
+            "immediate_action": "立即行动/等待确认/观察/止损止盈预警/禁止追高/无盘中动作",
+            "watch_conditions": ["观察条件1", "观察条件2"],
+            "next_check_time": "下一次检查点或市场本地时间",
+            "confidence_reason": "置信度理由，说明阶段和数据质量限制",
+            "data_limitations": ["阶段或数据质量限制1", "阶段或数据质量限制2"]
         }
     },
 
@@ -1763,7 +1917,9 @@ class GeminiAnalyzer:
 - 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
-- 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。"""
+- 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
+- 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
+- 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。"""
 
     SYSTEM_PROMPT = """你是一位{market_placeholder}投资分析师，负责生成专业的【决策仪表盘】分析报告。
 
@@ -1854,6 +2010,16 @@ class GeminiAnalyzer:
                 "✅/⚠️/❌ 检查项5：仓位与止损计划明确",
                 "✅/⚠️/❌ 检查项6：估值/业绩/催化与结论匹配"
             ]
+        },
+
+        "phase_decision": {
+            "phase_context": {"phase": "premarket/intraday/lunch_break/closing_auction/postmarket/non_trading/unknown"},
+            "action_window": "盘前计划/盘中跟踪/午间确认/收盘前风控/盘后复盘/非交易日观察",
+            "immediate_action": "立即行动/等待确认/观察/止损止盈预警/禁止追高/无盘中动作",
+            "watch_conditions": ["观察条件1", "观察条件2"],
+            "next_check_time": "下一次检查点或市场本地时间",
+            "confidence_reason": "置信度理由，说明阶段和数据质量限制",
+            "data_limitations": ["阶段或数据质量限制1", "阶段或数据质量限制2"]
         }
     },
 
@@ -1918,7 +2084,9 @@ class GeminiAnalyzer:
 - 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
-- 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。"""
+- 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
+- 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
+- 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。"""
 
     TEXT_SYSTEM_PROMPT = """你是一位专业的股票分析助手。
 
@@ -2199,21 +2367,21 @@ class GeminiAnalyzer:
         effective_kwargs.update(extra_litellm_params(model, config))
         return litellm.completion(**effective_kwargs)
 
-    def _normalize_usage(self, usage_obj: Any) -> Dict[str, Any]:
+    def _normalize_usage(
+        self,
+        usage_obj: Any,
+        *,
+        model: str = "",
+        provider: Optional[str] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """Normalize usage objects from LiteLLM responses/chunks."""
         if not usage_obj:
-            return {}
-
-        def _get_value(key: str) -> int:
-            if isinstance(usage_obj, dict):
-                return int(usage_obj.get(key) or 0)
-            return int(getattr(usage_obj, key, 0) or 0)
-
-        return {
-            "prompt_tokens": _get_value("prompt_tokens"),
-            "completion_tokens": _get_value("completion_tokens"),
-            "total_tokens": _get_value("total_tokens"),
-        }
+            return attach_message_hmacs({}, messages) if messages is not None else {}
+        usage = normalize_litellm_usage(usage_obj, model=model, provider=provider)
+        if messages is not None:
+            usage = attach_message_hmacs(usage, messages)
+        return usage
 
     @staticmethod
     def _get_response_field(obj: Any, key: str) -> Any:
@@ -2318,6 +2486,8 @@ class GeminiAnalyzer:
         stream_response: Any,
         *,
         model: str,
+        usage_model: Optional[str] = None,
+        provider: Optional[str] = None,
         progress_callback: Optional[Callable[[int], None]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Consume a LiteLLM stream into a single text payload."""
@@ -2328,8 +2498,12 @@ class GeminiAnalyzer:
 
         try:
             for chunk in stream_response:
-                chunk_usage = chunk.get("usage") if isinstance(chunk, dict) else getattr(chunk, "usage", None)
-                normalized_usage = self._normalize_usage(chunk_usage)
+                chunk_usage = extract_usage_payload(chunk)
+                normalized_usage = self._normalize_usage(
+                    chunk_usage,
+                    model=usage_model or model,
+                    provider=provider,
+                )
                 if normalized_usage:
                     usage = normalized_usage
 
@@ -2369,6 +2543,7 @@ class GeminiAnalyzer:
         stream: bool = False,
         stream_progress_callback: Optional[Callable[[int], None]] = None,
         response_validator: Optional[Callable[[str], None]] = None,
+        audit_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str, Dict[str, Any]]:
         """Call LLM via litellm with fallback across configured models.
 
@@ -2414,8 +2589,26 @@ class GeminiAnalyzer:
             legacy_router_model_list = getattr(self, "_legacy_router_model_list", None) or []
             if legacy_router_model_list and model == config.litellm_model and not use_channel_router:
                 recovery_model_list = legacy_router_model_list
+            usage_model, usage_provider = resolved_model_provider_identity(model, recovery_model_list)
 
             try:
+                def _attach_usage_audit(
+                    usage: Dict[str, Any],
+                    messages: List[Dict[str, Any]],
+                ) -> Dict[str, Any]:
+                    if audit_context is None:
+                        return attach_message_hmacs(usage, messages)
+                    effective_audit_context = dict(audit_context)
+                    effective_audit_context["provider"] = usage_provider
+                    effective_audit_context["transport"] = (
+                        effective_audit_context.get("transport") or "litellm"
+                    )
+                    return attach_legacy_message_stability_audit(
+                        usage,
+                        messages,
+                        effective_audit_context,
+                    )
+
                 model_short = model.split("/")[-1] if "/" in model else model
                 extra = get_thinking_extra_body(model_short)
                 call_kwargs: Dict[str, Any] = {
@@ -2472,6 +2665,8 @@ class GeminiAnalyzer:
                         _stream_text, _stream_usage = self._consume_litellm_stream(
                             stream_response,
                             model=model,
+                            usage_model=usage_model,
+                            provider=usage_provider,
                             progress_callback=stream_progress_callback,
                         )
                     except _LiteLLMStreamError as exc:
@@ -2498,6 +2693,7 @@ class GeminiAnalyzer:
                 if _stream_text is not None:
                     last_response_text = _stream_text
                     last_model = model
+                    _stream_usage = _attach_usage_audit(_stream_usage, call_kwargs["messages"])
                     last_usage = _stream_usage
                     if response_validator is not None:
                         response_validator(_stream_text)
@@ -2519,7 +2715,15 @@ class GeminiAnalyzer:
 
                 content = self._extract_completion_text(response)
                 if content:
-                    usage = self._normalize_usage(self._get_response_field(response, "usage"))
+                    usage_messages = None if audit_context is not None else call_kwargs["messages"]
+                    usage = self._normalize_usage(
+                        extract_usage_payload(response),
+                        model=usage_model or model,
+                        provider=usage_provider,
+                        messages=usage_messages,
+                    )
+                    if audit_context is not None:
+                        usage = _attach_usage_audit(usage, call_kwargs["messages"])
                     last_response_text = content
                     last_model = model
                     last_usage = usage
@@ -2610,6 +2814,7 @@ class GeminiAnalyzer:
         config = self._get_runtime_config()
         report_language = normalize_report_language(getattr(config, "report_language", "zh"))
         system_prompt = self._get_analysis_system_prompt(report_language, stock_code=code)
+        skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections()
         
         # 请求前增加延时（防止连续请求触发限流）
         request_delay = config.gemini_request_delay
@@ -2654,6 +2859,26 @@ class GeminiAnalyzer:
                 report_language=report_language,
                 analysis_context_pack_summary=analysis_context_pack_summary,
             )
+            legacy_audit_context = {
+                "language": report_language,
+                "market_group": _legacy_market_group(code),
+                "analysis_mode": "stock_analysis",
+                "legacy_prompt_mode": "legacy_default" if use_legacy_default_prompt else "skill_aware",
+                "skill_config": {
+                    "skill_instructions": skill_instructions,
+                    "default_skill_policy": default_skill_policy,
+                    "use_legacy_default_prompt": use_legacy_default_prompt,
+                },
+                "transport": "litellm",
+                "dynamic_markers": _legacy_audit_marker_specs(
+                    context,
+                    code=code,
+                    stock_name=name,
+                    report_language=report_language,
+                    news_context=news_context,
+                    analysis_context_pack_summary=analysis_context_pack_summary,
+                ),
+            }
             
             config = self._get_runtime_config()
             model_name = config.litellm_model or "unknown"
@@ -2691,6 +2916,7 @@ class GeminiAnalyzer:
                         stream=True,
                         stream_progress_callback=stream_progress_callback,
                         response_validator=self._validate_json_response,
+                        audit_context=legacy_audit_context,
                     )
                 except _AllModelsFailedError as exc:
                     if exc.last_response_text is not None:
@@ -2731,7 +2957,11 @@ class GeminiAnalyzer:
                 # 内容完整性校验（可选）
                 if not config.report_integrity_enabled:
                     break
-                pass_integrity, missing_fields = self._check_content_integrity(result)
+                require_phase_decision = isinstance(context.get("market_phase_context"), dict)
+                pass_integrity, missing_fields = self._check_content_integrity(
+                    result,
+                    require_phase_decision=require_phase_decision,
+                )
                 if pass_integrity:
                     break
                 if retry_count < max_retries:
@@ -2855,6 +3085,12 @@ class GeminiAnalyzer:
             context.get("market_phase_context"),
             report_language=report_language,
         )
+        daily_market_context_section = format_daily_market_context_prompt_section(
+            context.get("daily_market_context"),
+            report_language=report_language,
+        )
+        if daily_market_context_section:
+            prompt += daily_market_context_section
         if isinstance(analysis_context_pack_summary, str) and analysis_context_pack_summary:
             prompt += analysis_context_pack_summary
         prompt += f"""
@@ -3332,9 +3568,14 @@ class GeminiAnalyzer:
 
         return snapshot
 
-    def _check_content_integrity(self, result: AnalysisResult) -> Tuple[bool, List[str]]:
+    def _check_content_integrity(
+        self,
+        result: AnalysisResult,
+        *,
+        require_phase_decision: bool = False,
+    ) -> Tuple[bool, List[str]]:
         """Delegate to module-level check_content_integrity."""
-        return check_content_integrity(result)
+        return check_content_integrity(result, require_phase_decision=require_phase_decision)
 
     def _build_integrity_complement_prompt(self, missing_fields: List[str], report_language: str = "zh") -> str:
         """Build complement instruction for missing mandatory fields."""
@@ -3354,6 +3595,20 @@ class GeminiAnalyzer:
                     lines.append("- dashboard.intelligence.risk_alerts: risk alert list (can be empty)")
                 elif f == "dashboard.battle_plan.sniper_points.stop_loss":
                     lines.append("- dashboard.battle_plan.sniper_points.stop_loss: stop-loss level")
+                elif f == "dashboard.phase_decision.phase_context":
+                    lines.append("- dashboard.phase_decision.phase_context: public market phase summary subset")
+                elif f == "dashboard.phase_decision.action_window":
+                    lines.append("- dashboard.phase_decision.action_window: phase-aware action window")
+                elif f == "dashboard.phase_decision.immediate_action":
+                    lines.append("- dashboard.phase_decision.immediate_action: act now / wait / watch / no intraday action")
+                elif f == "dashboard.phase_decision.watch_conditions":
+                    lines.append("- dashboard.phase_decision.watch_conditions: list of watch conditions")
+                elif f == "dashboard.phase_decision.next_check_time":
+                    lines.append("- dashboard.phase_decision.next_check_time: next check point or market-local time")
+                elif f == "dashboard.phase_decision.confidence_reason":
+                    lines.append("- dashboard.phase_decision.confidence_reason: confidence rationale and data limits")
+                elif f == "dashboard.phase_decision.data_limitations":
+                    lines.append("- dashboard.phase_decision.data_limitations: list of phase/data quality limitations")
             return "\n".join(lines)
 
         lines = ["### 补全要求：请在上方分析基础上补充以下必填内容，并输出完整 JSON："]
@@ -3370,6 +3625,20 @@ class GeminiAnalyzer:
                 lines.append("- dashboard.intelligence.risk_alerts: 风险警报列表（可为空数组）")
             elif f == "dashboard.battle_plan.sniper_points.stop_loss":
                 lines.append("- dashboard.battle_plan.sniper_points.stop_loss: 止损价")
+            elif f == "dashboard.phase_decision.phase_context":
+                lines.append("- dashboard.phase_decision.phase_context: 公开低敏市场阶段摘要子集")
+            elif f == "dashboard.phase_decision.action_window":
+                lines.append("- dashboard.phase_decision.action_window: 阶段化行动窗口")
+            elif f == "dashboard.phase_decision.immediate_action":
+                lines.append("- dashboard.phase_decision.immediate_action: 立即行动/等待确认/观察/无盘中动作")
+            elif f == "dashboard.phase_decision.watch_conditions":
+                lines.append("- dashboard.phase_decision.watch_conditions: 观察条件数组")
+            elif f == "dashboard.phase_decision.next_check_time":
+                lines.append("- dashboard.phase_decision.next_check_time: 下一次检查点或市场本地时间")
+            elif f == "dashboard.phase_decision.confidence_reason":
+                lines.append("- dashboard.phase_decision.confidence_reason: 置信度理由与数据限制")
+            elif f == "dashboard.phase_decision.data_limitations":
+                lines.append("- dashboard.phase_decision.data_limitations: 阶段/数据质量限制数组")
         return "\n".join(lines)
 
     def _build_integrity_retry_prompt(
@@ -3456,7 +3725,11 @@ class GeminiAnalyzer:
                     op = data.get('operation_advice', 'Hold' if report_language == "en" else '持有')
                     decision_type = infer_decision_type_from_advice(op, default='hold')
                 
-                return AnalysisResult(
+                explicit_action = data.get("action")
+                if explicit_action is None and isinstance(dashboard, dict):
+                    explicit_action = dashboard.get("action")
+
+                result = AnalysisResult(
                     code=code,
                     name=name,
                     # 核心指标
@@ -3498,6 +3771,7 @@ class GeminiAnalyzer:
                     data_sources=data.get('data_sources', 'Technical data' if report_language == "en" else '技术面数据'),
                     success=True,
                 )
+                return populate_decision_action_fields(result, explicit_action=explicit_action)
             else:
                 # 没有找到 JSON，标记为失败
                 logger.warning(f"无法从响应中提取 JSON，标记为解析失败")
@@ -3595,7 +3869,7 @@ class GeminiAnalyzer:
         # 截取前500字符作为摘要
         summary = response_text[:500] if response_text else ('No analysis result' if report_language == "en" else '无分析结果')
         
-        return AnalysisResult(
+        result = AnalysisResult(
             code=code,
             name=name,
             sentiment_score=sentiment_score,
@@ -3611,6 +3885,7 @@ class GeminiAnalyzer:
             error_message='LLM response is not valid JSON; analysis result will not be persisted',
             report_language=report_language,
         )
+        return populate_decision_action_fields(result)
     
     def batch_analyze(
         self, 

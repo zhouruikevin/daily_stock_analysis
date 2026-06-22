@@ -1,6 +1,8 @@
 import type { SystemConfigCategory } from '../types/systemConfig';
+import type { UiLanguage } from '../i18n/uiText';
 
-const categoryTitleMap: Record<SystemConfigCategory, string> = {
+const categoryTitleMap: Record<UiLanguage, Record<SystemConfigCategory, string>> = {
+  zh: {
   base: '基础设置',
   data_source: '数据源',
   ai_model: 'AI 模型',
@@ -9,9 +11,21 @@ const categoryTitleMap: Record<SystemConfigCategory, string> = {
   agent: 'Agent 设置',
   backtest: '回测配置',
   uncategorized: '其他',
+  },
+  en: {
+    base: 'Base settings',
+    data_source: 'Data sources',
+    ai_model: 'AI models',
+    notification: 'Notifications',
+    system: 'System',
+    agent: 'Agent',
+    backtest: 'Backtest',
+    uncategorized: 'Other',
+  },
 };
 
-const categoryDescriptionMap: Partial<Record<SystemConfigCategory, string>> = {
+const categoryDescriptionMap: Record<UiLanguage, Partial<Record<SystemConfigCategory, string>>> = {
+  zh: {
   base: '管理自选股与基础运行参数。',
   data_source: '管理行情数据源与优先级策略。',
   ai_model: '管理模型服务、模型名称与推理参数。',
@@ -20,6 +34,17 @@ const categoryDescriptionMap: Partial<Record<SystemConfigCategory, string>> = {
   agent: '管理 Agent 模式、策略与多 Agent 编排配置。',
   backtest: '管理回测开关、评估窗口和引擎参数。',
   uncategorized: '其他未归类的配置项。',
+  },
+  en: {
+    base: 'Manage watchlists and base runtime parameters.',
+    data_source: 'Manage market data sources and priority strategies.',
+    ai_model: 'Manage model services, model names, and inference parameters.',
+    notification: 'Manage bots, webhooks, and notification delivery.',
+    system: 'Manage scheduling, logging, ports, and system parameters.',
+    agent: 'Manage Agent mode, strategies, and multi-agent orchestration.',
+    backtest: 'Manage backtest switches, evaluation windows, and engine parameters.',
+    uncategorized: 'Other uncategorized settings.',
+  },
 };
 
 const fieldTitleMap: Record<string, string> = {
@@ -51,6 +76,8 @@ const fieldTitleMap: Record<string, string> = {
   LITELLM_CONFIG: '高级模型路由配置',
   LLM_CHANNELS: 'LLM 渠道列表',
   LLM_TEMPERATURE: '采样温度',
+  LLM_USAGE_HMAC_SECRET: 'LLM 用量 HMAC 密钥',
+  LLM_USAGE_HMAC_KEY_VERSION: 'LLM 用量 HMAC 版本',
   AIHUBMIX_KEY: 'AIHubmix Key',
   ANSPIRE_LLM_ENABLED: '启用 Anspire 大模型',
   ANSPIRE_LLM_BASE_URL: 'Anspire 大模型网关',
@@ -122,16 +149,19 @@ const fieldTitleMap: Record<string, string> = {
   REPORT_SHOW_LLM_MODEL: '显示分析模型',
   MAX_WORKERS: '最大并发线程数',
   SCHEDULE_ENABLED: '启用定时任务',
-  SCHEDULE_RUN_IMMEDIATELY: '保存后立即执行定时任务',
+  SCHEDULE_TIMES: '定时执行时间',
+  SCHEDULE_RUN_IMMEDIATELY: '启动定时模式后立即执行',
   TRADING_DAY_CHECK_ENABLED: '启用交易日检查',
   WEBUI_HOST: 'WebUI 监听地址',
   ADMIN_AUTH_ENABLED: '启用后台登录鉴权',
   TRUST_X_FORWARDED_FOR: '信任 X-Forwarded-For',
   RUN_IMMEDIATELY: '启动后立即运行',
   MARKET_REVIEW_ENABLED: '启用大盘复盘',
+  DAILY_MARKET_CONTEXT_ENABLED: '大盘上下文约束个股分析',
   MARKET_REVIEW_REGION: '大盘复盘市场',
   MARKET_REVIEW_COLOR_SCHEME: '大盘复盘涨跌颜色',
   ANALYSIS_DELAY: '分析启动延迟（秒）',
+  SAVE_CONTEXT_SNAPSHOT: '保存分析上下文快照',
   SCHEDULE_TIME: '定时任务时间',
   DEBUG: '调试模式',
   HTTP_PROXY: 'HTTP 代理',
@@ -197,6 +227,8 @@ const fieldDescriptionMap: Record<string, string> = {
   LITELLM_CONFIG: '高级模型路由 YAML 配置文件路径（高级用法）。仅在 YAML 可解析且产出 model_list 时优先于渠道与旧配置，否则会回退。',
   LLM_CHANNELS: '渠道名称列表（逗号分隔）。推荐使用上方渠道编辑器管理。',
   LLM_TEMPERATURE: '控制模型输出随机性，0 为确定性输出，2 为最大随机性，推荐 0.7。',
+  LLM_USAGE_HMAC_SECRET: '用于 LLM 用量遥测 message HMAC 的部署级密钥。留空时使用本地自动生成的密钥文件。',
+  LLM_USAGE_HMAC_KEY_VERSION: 'LLM 用量遥测 HMAC 密钥版本标签；轮换密钥时同步更新，避免跨版本 hash 被误比较。',
   AIHUBMIX_KEY: 'AIHubmix 一站式密钥，自动指向 aihubmix.com/v1。',
   ANSPIRE_LLM_ENABLED: '开启后，未配置更高优先级 LLM 渠道或 OpenAI 兼容密钥时，ANSPIRE_API_KEYS 会自动作为 Anspire 大模型密钥使用。',
   ANSPIRE_LLM_BASE_URL: 'Anspire OpenAI 兼容网关地址，默认 https://open-gateway.anspire.cn/v6，海外可用 https://open-gateway.anspire.ai/v6。',
@@ -268,16 +300,19 @@ const fieldDescriptionMap: Record<string, string> = {
   REPORT_SHOW_LLM_MODEL: '在通知报告底部显示本次分析使用的 LLM 模型名称；关闭后隐藏运行时模型信息。仅影响展示，不会影响 provider/model/Base URL、运行时模型保存、迁移或清理。',
   MAX_WORKERS: '异步任务队列最大并发数。配置保存后，队列空闲时会自动应用；繁忙时延后生效。',
   SCHEDULE_ENABLED: '启用每日定时分析任务。',
-  SCHEDULE_RUN_IMMEDIATELY: '保存定时配置后立即触发一次任务。',
+  SCHEDULE_TIMES: '多个每日定时任务执行时间，使用逗号分隔；Web 设置页会以时间控件维护。',
+  SCHEDULE_RUN_IMMEDIATELY: '仅影响 schedule 模式启动时是否立即触发一次任务；保存 Web 设置不会触发执行。',
   TRADING_DAY_CHECK_ENABLED: '启用交易日校验，非交易日自动跳过定时分析。',
   WEBUI_HOST: 'WebUI 服务监听地址（默认通常为 0.0.0.0）。',
   ADMIN_AUTH_ENABLED: '启用 Web 管理端账号密码登录校验。',
   TRUST_X_FORWARDED_FOR: '启用后信任反向代理透传的 X-Forwarded-For 源 IP。',
   RUN_IMMEDIATELY: '程序启动后立即执行一次分析任务。',
   MARKET_REVIEW_ENABLED: '是否启用大盘复盘流程。',
+  DAILY_MARKET_CONTEXT_ENABLED: '默认开启。开启后会把当日大盘摘要注入个股分析，并在高风险或退潮环境下软化激进买入建议；关闭后仍可运行大盘复盘。',
   MARKET_REVIEW_REGION: '大盘复盘默认市场区域（如 cn/us/hk）。',
   MARKET_REVIEW_COLOR_SCHEME: '控制大盘复盘指数涨跌幅图标颜色：green_up 为绿涨红跌，red_up 为红涨绿跌。',
   ANALYSIS_DELAY: '启动任务前的延迟秒数，可用于等待依赖服务就绪。',
+  SAVE_CONTEXT_SNAPSHOT: '控制是否持久化整份分析历史 context_snapshot；关闭后不会保存低敏输入概览、市场阶段摘要和增强上下文，但不影响当次分析的 pack 构建或 Prompt 摘要。',
   SCHEDULE_TIME: '每日定时任务执行时间，格式为 HH:MM。',
   DEBUG: '启用调试模式，输出更多诊断日志。',
   HTTP_PROXY: '网络代理地址，可留空。',
@@ -379,16 +414,89 @@ const fieldOptionLabelMap: Record<string, Record<string, string>> = {
   },
 };
 
+const fieldOptionLabelMapEn: Record<string, Record<string, string>> = {
+  NEWS_STRATEGY_PROFILE: {
+    ultra_short: 'Ultra short (1 day)',
+    short: 'Short (3 days)',
+    medium: 'Medium (7 days)',
+    long: 'Long (30 days)',
+  },
+  REPORT_TYPE: {
+    simple: 'Simple',
+    full: 'Full',
+    brief: 'Brief',
+  },
+  REPORT_LANGUAGE: {
+    zh: 'Chinese',
+    en: 'English',
+    chinese: 'Chinese',
+    english: 'English',
+  },
+  NOTIFICATION_MIN_SEVERITY: {
+    '': 'Not set',
+    'not set': 'Not set',
+    info: 'Info',
+    warning: 'Warning',
+    error: 'Error',
+    critical: 'Critical',
+  },
+  MARKET_REVIEW_COLOR_SCHEME: {
+    green_up: 'Green up / red down',
+    red_up: 'Red up / green down',
+    'green up / red down': 'Green up / red down',
+    'red up / green down': 'Red up / green down',
+  },
+  LOG_LEVEL: {
+    debug: 'Debug',
+    info: 'Info',
+    warning: 'Warning',
+    error: 'Error',
+    critical: 'Critical',
+  },
+  MARKET_REVIEW_REGION: {
+    cn: 'A-shares',
+    hk: 'Hong Kong',
+    us: 'US',
+    both: 'All markets',
+  },
+  AGENT_ARCH: {
+    single: 'Single Agent',
+    multi: 'Multi Agent (orchestrator)',
+    'single agent': 'Single Agent',
+    'multi agent (orchestrator)': 'Multi Agent (orchestrator)',
+  },
+  AGENT_ORCHESTRATOR_MODE: {
+    quick: 'Quick',
+    standard: 'Standard',
+    full: 'Full',
+    specialist: 'Specialist',
+  },
+  AGENT_SKILL_ROUTING: {
+    auto: 'Auto (regime-based)',
+    manual: 'Manual (use AGENT_SKILLS)',
+    'auto (regime-based)': 'Auto (regime-based)',
+    'manual (use agent_skills)': 'Manual (use AGENT_SKILLS)',
+  },
+};
+
 function normalizeOptionToken(raw: string): string {
   return raw.trim().toLowerCase();
 }
 
 export function getCategoryTitleZh(category: SystemConfigCategory, fallback?: string): string {
-  return categoryTitleMap[category] || fallback || category;
+  return getCategoryTitle(category, fallback, 'zh');
 }
 
 export function getCategoryDescriptionZh(category: SystemConfigCategory, fallback?: string): string {
-  return categoryDescriptionMap[category] || fallback || '';
+  return getCategoryDescription(category, fallback, 'zh');
+}
+
+export function getCategoryTitle(category: SystemConfigCategory, fallback?: string, locale: UiLanguage = 'zh'): string {
+  return categoryTitleMap[locale][category] || fallback || category;
+}
+
+export function getCategoryDescription(category: SystemConfigCategory, fallback?: string, locale: UiLanguage = 'zh'): string {
+  return categoryDescriptionMap[locale][category] || fallback || '';
 }
 
 export function getFieldTitleZh(key: string, fallback?: string): string {
@@ -400,7 +508,16 @@ export function getFieldDescriptionZh(key: string, fallback?: string): string {
 }
 
 export function getFieldOptionLabelZh(key: string, value: string, fallbackLabel?: string): string {
-  const map = fieldOptionLabelMap[key];
+  return getFieldOptionLabel(key, value, fallbackLabel, 'zh');
+}
+
+export function getFieldOptionLabel(
+  key: string,
+  value: string,
+  fallbackLabel?: string,
+  locale: UiLanguage = 'zh',
+): string {
+  const map = locale === 'en' ? fieldOptionLabelMapEn[key] : fieldOptionLabelMap[key];
   if (!map) {
     return fallbackLabel ?? value;
   }
