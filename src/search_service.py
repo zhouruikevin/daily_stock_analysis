@@ -297,6 +297,9 @@ class BaseSearchProvider(ABC):
             error_count = self._key_errors[key]
         logger.warning(f"[{self._name}] API Key {key[:8]}... 错误计数: {error_count}")
 
+    # 瞬时错误最大重试次数（避免所有 key 都超时时无限循环）
+    _TRANSIENT_MAX_RETRIES = 3
+
     @staticmethod
     def _is_quota_exhausted(error_msg: str) -> bool:
         """检查错误是否为配额耗尽（永久性故障）"""
@@ -311,6 +314,34 @@ class BaseSearchProvider(ABC):
             or 'rate limit' in msg_lower
             or 'quota' in msg_lower
         )
+
+    @staticmethod
+    def _is_transient_error(error_msg: str) -> bool:
+        """检查错误是否为瞬时性故障（可换 Key 重试）
+
+        瞬时错误包括：超时、连接失败、SSL 错误、5xx 服务端错误等。
+        这类错误不应放弃整个请求，应尝试下一个 Key。
+        """
+        if not error_msg:
+            return False
+        msg_lower = error_msg.lower()
+        return (
+            'timed out' in msg_lower
+            or 'timeout' in msg_lower
+            or 'connection' in msg_lower
+            or 'ssl' in msg_lower
+            or 'network' in msg_lower
+            or 'temporary failure' in msg_lower
+            or 'server error' in msg_lower
+            or '502' in error_msg
+            or '503' in error_msg
+            or '504' in error_msg
+        )
+
+    @staticmethod
+    def _is_transient_exception(exc: Exception) -> bool:
+        """检查异常是否为瞬时性故障"""
+        return isinstance(exc, _SEARCH_TRANSIENT_EXCEPTIONS)
     
     @abstractmethod
     def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
@@ -326,9 +357,16 @@ class BaseSearchProvider(ABC):
         api_key: Optional[str] = None,
         **search_kwargs: Any,
     ) -> SearchResponse:
-        """Run the shared search flow with automatic key failover on quota exhaustion."""
+        """Run the shared search flow with automatic key failover.
+
+        Failover strategy (by error type):
+        - Quota exhausted → blacklist key + skip + try next key
+        - Transient error (timeout/network) → try next key (up to _TRANSIENT_MAX_RETRIES)
+        - Other non-recoverable error → return immediately
+        """
         max_attempts = 1 if api_key else len(self._api_keys)
         last_response = None
+        transient_retries = 0
 
         for attempt in range(max_attempts):
             current_key = api_key if api_key else self._get_next_key()
@@ -351,8 +389,10 @@ class BaseSearchProvider(ABC):
                 else:
                     self._record_error(current_key)
                     last_response = response
+                    error_msg = response.error_message or ''
+
                     # 配额耗尽：标记黑名单 + 立即重试下一个 Key
-                    if self._is_quota_exhausted(response.error_message or ''):
+                    if self._is_quota_exhausted(error_msg):
                         self._blacklist.mark_exhausted(current_key)
                         self._key_errors[current_key] = 3  # 立即跳过
                         logger.warning(
@@ -361,7 +401,16 @@ class BaseSearchProvider(ABC):
                         )
                         continue  # 重试下一个 Key
 
-                    # 临时错误不重试，直接返回
+                    # 瞬时错误（超时/网络）：换下一个 Key 重试
+                    if self._is_transient_error(error_msg) and transient_retries < self._TRANSIENT_MAX_RETRIES:
+                        transient_retries += 1
+                        logger.warning(
+                            f"[{self._name}] Key {current_key[:8]}... 瞬时错误({error_msg[:60]}), "
+                            f"换下一个 Key 重试 ({transient_retries}/{self._TRANSIENT_MAX_RETRIES})"
+                        )
+                        continue
+
+                    # 其他不可恢复错误，直接返回
                     return response
             except Exception as e:
                 elapsed = time.time() - start_time
@@ -375,13 +424,23 @@ class BaseSearchProvider(ABC):
                     error_message=error_msg,
                     search_time=elapsed,
                 )
-                # 配额耗尽异常也触发重试
+                # 配额耗尽异常：标记黑名单 + 重试
                 if self._is_quota_exhausted(error_msg):
                     self._blacklist.mark_exhausted(current_key)
                     self._key_errors[current_key] = 3
                     logger.warning(
                         f"[{self._name}] Key {current_key[:8]}... 配额耗尽(异常)，"
                         f"尝试下一个 Key (attempt {attempt + 1}/{max_attempts})"
+                    )
+                    continue
+
+                # 瞬时异常（超时/网络）：换下一个 Key 重试
+                if self._is_transient_exception(e) and transient_retries < self._TRANSIENT_MAX_RETRIES:
+                    transient_retries += 1
+                    logger.warning(
+                        f"[{self._name}] Key {current_key[:8]}... 瞬时异常({type(e).__name__}), "
+                        f"换下一个 Key 重试 ({transient_retries}/{self._TRANSIENT_MAX_RETRIES}), "
+                        f"耗时 {elapsed:.2f}s"
                     )
                     continue
 
@@ -526,45 +585,18 @@ class TavilySearchProvider(BaseSearchProvider):
         days: int = 7,
         topic: Optional[str] = None,
     ) -> SearchResponse:
-        """执行 Tavily 搜索，可按调用方选择是否启用新闻 topic。"""
-        if topic is None:
-            return super().search(query, max_results=max_results, days=days)
-
-        api_key = self._get_next_key()
-        if not api_key:
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self._name,
-                success=False,
-                error_message=f"{self._name} 未配置 API Key"
+        """执行 Tavily 搜索，可按调用方选择是否启用新闻 topic。
+        
+        统一走基类 _execute_search() 的 failover 机制：
+        - 自动跳过黑名单中的 Key（配额耗尽）
+        - 配额耗尽时自动 mark_exhausted() + 切换下一个 Key
+        - 黑名单每月 1 号自动刷新
+        """
+        if topic is not None:
+            return self._execute_search(
+                query, max_results=max_results, days=days, topic=topic
             )
-
-        start_time = time.time()
-        try:
-            response = self._do_search(query, api_key, max_results, days=days, topic=topic)
-            response.search_time = time.time() - start_time
-
-            if response.success:
-                self._record_success(api_key)
-                logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
-            else:
-                self._record_error(api_key)
-
-            return response
-
-        except Exception as e:
-            self._record_error(api_key)
-            elapsed = time.time() - start_time
-            logger.error(f"[{self._name}] 搜索 '{query}' 失败: {e}")
-            return SearchResponse(
-                query=query,
-                results=[],
-                provider=self._name,
-                success=False,
-                error_message=str(e),
-                search_time=elapsed
-            )
+        return super().search(query, max_results=max_results, days=days)
     
     @staticmethod
     def _extract_domain(url: str) -> str:
