@@ -6,9 +6,12 @@ description: >
   量价健康度决定置信、关键位约束路径，输出未来 5-10 交易日的
   顺势延续/震荡回踩/趋势反转 三情景（各带概率+目标价区间）。
   每次预测落台账，回填 T+1 与 horizon 末真实走势，用历史命中率校准后续预测。
+  另含自适应「上下沿通道」：有趋势用回归通道、震荡用水平箱体，给出上沿/下沿/
+  当前位置 + 量价突破判断（突破上沿/跌破下沿/通道内震荡），判断纳入台账评估。
   Use when the user asks about 指数走势预测, 后续走势, 后市, 趋势研判, 顺势,
   量价, 量价配合, 量价健康, 趋势延续/反转, 震荡回踩, 目标位, 预测命中率,
-  预测校准, index trend/forecast/momentum, or mentions 上证/深成/创业板/科创50 后市。
+  预测校准, 上下沿, 通道, 上沿, 下沿, 阻力支撑, 突破, 跌破,
+  index trend/forecast/momentum/channel, or mentions 上证/深成/创业板/科创50 后市。
   与 index-analysis(顶背离+关键位) 互补：那个判"是否见顶"，这个预测"接下来怎么走"。
   Default indices: sh/sz/cy/kc（上证/深成/创业板/科创50）。
 ---
@@ -93,7 +96,20 @@ python3 skills/index-trend/scripts/index_trend.py --no-email   # 不发邮件
 
 基准 60。顺势放量 +20 / 价升量缩背离 -20 / 放量滞涨 -15 / 天量(量比>2.5)按位置减分 / 缩量整理轻微。输出 `health_score`(0-100) + 标签（健康≥67/中性≥34/背离衰竭）+ 命中信号列表。
 
-### 3. 概率化情景推演
+### 3. 上下沿通道（自适应：回归通道 / 水平箱体）
+
+"通道就是上下沿"——近期走势被框在一条上沿、一条下沿之间。自适应选形态：
+
+- **有趋势**（近 N 日回归 r² ≥ `--channel-r2`，默认 0.5）→ **回归通道**：中轨=回归线随趋势倾斜，上沿=中轨+`k`·残差σ、下沿=中轨−`k`·σ（`k`=`--channel-k`，默认 2）。
+- **震荡**（r² < 阈值）→ **水平箱体**：上沿=近 N 日 high 的 90 分位、下沿=low 的 10 分位（分位抗插针）。
+  - 实盘依据：震荡市回归通道斜率无意义，故降级为水平箱体。
+
+输出 `type`/`upper`/`mid`/`lower`/`pos_in_channel`(0-1)/`direction`/`r2`/`width_pct`。再结合量价给 `judgement`：
+贴上沿(pos≥0.8)+放量→倾向突破上沿、+缩量/滞涨→上沿假突破回落；贴下沿(pos≤0.2)+放量→倾向跌破下沿、+缩量→下沿企稳反弹；中部→通道内震荡。
+
+**评估**：通道判断随预测一起入台账，回填时按 horizon 窗口算 **含纳率**（收盘落在通道内比例）、**bias 命中率**（判断是否兑现）、**上/下沿误差%**，`--review` 展示（见第 6 节）。
+
+### 4. 概率化情景推演
 
 | 情景 | 方向 | 目标区间来源 |
 |------|------|------|
@@ -112,7 +128,7 @@ p_cons = 100 - p_cont - p_rev
 
 整体预期波动带 = `current ± 1.0·ATR14·√horizon`；T+1 预期带 = `current ± 1.0·ATR14`。
 
-### 4. 历史校准（用已发生数据修正后面的答案）
+### 5. 历史校准（用已发生数据修正后面的答案）
 
 读台账聚合该指数历史表现（**近期指数加权**），对原始预测做**有界 + 收缩式**修正：
 
@@ -123,7 +139,7 @@ p_cons = 100 - p_cont - p_rev
 
 修正量在输出的 `calibration` 段显式列明（样本数 / w / 各项调整），透明可审计。`--no-calibration` 关闭。
 
-### 5. 预测台账与回填（`ledger/predictions.jsonl`，入 git）
+### 6. 预测台账与回填（`ledger/predictions.jsonl`，入 git）
 
 - 每次跑为每指数落一条预测（同 predict_date+index_key 重复跑则更新那条）。
 - **T+1 回填**：predict_date 后第 1 个交易日的真实收盘 → 方向命中 / 区间覆盖 / 偏差%。
@@ -139,6 +155,9 @@ p_cons = 100 - p_cont - p_rev
            "structure":"混合","ma_alignment":"空头排列","slope_pct_per_day":0.01,"r2":0.002},
   "volume_price":{"health_score":65,"health_label":"中性","vol_ratio":0.76,
                   "vol_trend":"缩量","signals":["缩量整理"]},
+  "channel":{"available":true,"type":"水平箱体","upper":4192.58,"mid":4081.73,"lower":3970.89,
+             "pos_in_channel":0.087,"direction":"横向","r2":0.292,"width_pct":5.56,
+             "judgement":{"bias":"临近下沿待企稳确认","confidence":"中","reason":".."}},
   "key_levels":{"resistance_levels":[...],"support_levels":[...],
                 "immediate_resistance":...,"immediate_support":...},
   "forecast":{"horizon_days":[5,10],"atr":64.25,
@@ -174,6 +193,9 @@ print(ledger.format_review(index_keys=["sh"]))   # 历史命中率报告
 | `--horizon` | 7 | 预测跨度（交易日） |
 | `--days` | 120 | 分析窗口（额外多取 60 算长均线/ATR） |
 | `--swing-threshold` | 3.0 | zigzag 幅度过滤 % |
+| `--channel-lookback` | 40 | 上下沿通道回溯交易日 |
+| `--channel-k` | 2.0 | 回归通道带宽 = k×残差σ |
+| `--channel-r2` | 0.5 | r²≥此值用回归通道，否则水平箱体 |
 | 顺势基准 | 35/45/55/65 | range/弱/中/强 |
 | health 基准 | 60 | 量价健康度起点 |
 | 撞位阈值 | 1.5% | 顺势方向距最近关键位 |
@@ -193,7 +215,8 @@ print(ledger.format_review(index_keys=["sh"]))   # 历史命中率报告
 
 ## 版本信息
 
-- Skill 版本: 1.0.0
+- Skill 版本: 1.1.0
 - 更新日期: 2026-07-07
 - 依赖: pandas, numpy, 仓库内 `data_provider`（Tushare/akshare）、`src/notification_sender`（邮件）
 - 与 `index-analysis` 互补，不共享脚本（各自包含）。
+- v1.1.0：新增自适应「上下沿通道」（回归通道/水平箱体）+ 量价突破判断 + 通道判断纳入台账评估。

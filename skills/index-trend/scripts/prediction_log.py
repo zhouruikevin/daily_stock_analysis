@@ -103,8 +103,24 @@ def build_record(result: Dict[str, Any], today: Optional[str] = None) -> Optiona
         "expected_range_t1": fc.get("expected_range_t1"),
         "scenarios_prob": {s["type"]: s.get("probability") for s in scenarios},
         "calibration": result.get("calibration"),
+        "channel": _channel_snapshot(result.get("channel")),
         "outcome_t1": None,
         "outcome_horizon": None,
+        "channel_outcome": None,
+    }
+
+
+def _channel_snapshot(ch: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """从 result["channel"] 抽出台账要存的通道快照（不可用则 None）。"""
+    if not ch or not ch.get("available"):
+        return None
+    return {
+        "type": ch.get("type"),
+        "upper": ch.get("upper"),
+        "lower": ch.get("lower"),
+        "mid": ch.get("mid"),
+        "pos_in_channel": ch.get("pos_in_channel"),
+        "bias": (ch.get("judgement") or {}).get("bias"),
     }
 
 
@@ -141,6 +157,46 @@ def _in_range(v: float, rng: Optional[Dict[str, float]]) -> Optional[bool]:
     if not rng or v is None:
         return None
     return bool(rng["low"] <= v <= rng["high"])
+
+
+def _eval_channel(ch: Dict[str, Any], window: "pd.DataFrame",
+                  last_close: float, hi: float, lo: float, base: float) -> Dict[str, Any]:
+    """通道判断的 horizon 窗口评估：含纳率 + bias 命中 + 上下沿误差。"""
+    upper = ch.get("upper")
+    lower = ch.get("lower")
+    bias = ch.get("bias")
+    closes = [float(c) for c in window["close"].tolist()]
+    if upper is None or lower is None or not closes:
+        return {"containment": None, "bias_hit": None,
+                "upper_err_pct": None, "lower_err_pct": None}
+
+    # 含纳率：窗口内收盘落在 [lower, upper] 的比例
+    inside = sum(1 for c in closes if lower <= c <= upper)
+    containment = round(inside / len(closes) * 100, 1)
+
+    # bias 命中判定
+    max_close = max(closes)
+    min_close = min(closes)
+    if bias == "倾向突破上沿":
+        bias_hit = max_close > upper
+    elif bias == "倾向跌破下沿":
+        bias_hit = min_close < lower
+    elif bias == "通道内震荡":
+        bias_hit = all(lower <= c <= upper for c in closes)
+    elif bias == "上沿假突破回落":
+        bias_hit = (hi >= upper) and (last_close <= upper)
+    elif bias == "下沿企稳反弹":
+        bias_hit = (lo <= lower * 1.005) and (last_close >= lower)
+    else:  # 待确认类不判命中
+        bias_hit = None
+
+    return {
+        "containment": containment,
+        "bias": bias,
+        "bias_hit": (bool(bias_hit) if bias_hit is not None else None),
+        "upper_err_pct": round((hi - upper) / base * 100, 2) if base else None,
+        "lower_err_pct": round((lo - lower) / base * 100, 2) if base else None,
+    }
 
 
 def backfill(index_dfs: Dict[str, pd.DataFrame], path: Optional[Path] = None) -> int:
@@ -208,6 +264,10 @@ def backfill(index_dfs: Dict[str, pd.DataFrame], path: Optional[Path] = None) ->
                 "err_pct": round((close - tgt_mid) / base * 100, 2)
                            if (tgt_mid and base) else None,
             }
+            # 通道判断评估（同 horizon 窗口）
+            ch = rec.get("channel")
+            if ch and rec.get("channel_outcome") is None:
+                rec["channel_outcome"] = _eval_channel(ch, window, close, hi, lo, base)
             changed += 1
 
     if changed:
@@ -229,6 +289,7 @@ def evaluate(records: List[Dict[str, Any]], index_key: Optional[str] = None) -> 
     recs = [r for r in records if (index_key is None or r.get("index_key") == index_key)]
     t1 = [r["outcome_t1"] for r in recs if r.get("outcome_t1")]
     hz = [r["outcome_horizon"] for r in recs if r.get("outcome_horizon")]
+    co = [r["channel_outcome"] for r in recs if r.get("channel_outcome")]
 
     def _rate(items, key):
         vals = [x[key] for x in items if x.get(key) is not None]
@@ -255,6 +316,39 @@ def evaluate(records: List[Dict[str, Any]], index_key: Optional[str] = None) -> 
         "horizon_mae_pct": _mae(hz),
         "horizon_bias_pct": _bias(hz),
         "reliability": _reliability(recs),
+        "channel": _eval_channel_metrics(co),
+    }
+
+
+def _eval_channel_metrics(co: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """通道评估聚合：平均含纳率、bias 命中率(总体+分类型)、上下沿平均绝对误差%。"""
+    if not co:
+        return {"n": 0}
+
+    def _avg(key):
+        vals = [x[key] for x in co if x.get(key) is not None]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    def _abs_avg(key):
+        vals = [abs(x[key]) for x in co if x.get(key) is not None]
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    hits = [x["bias_hit"] for x in co if x.get("bias_hit") is not None]
+    by_bias: Dict[str, List[bool]] = {}
+    for x in co:
+        if x.get("bias_hit") is None or not x.get("bias"):
+            continue
+        by_bias.setdefault(x["bias"], []).append(bool(x["bias_hit"]))
+    per_bias = {b: {"n": len(v), "hit_rate": round(sum(v) / len(v) * 100, 1)}
+                for b, v in by_bias.items()}
+
+    return {
+        "n": len(co),
+        "avg_containment": _avg("containment"),
+        "bias_hit_rate": round(sum(hits) / len(hits) * 100, 1) if hits else None,
+        "upper_mae_pct": _abs_avg("upper_err_pct"),
+        "lower_mae_pct": _abs_avg("lower_err_pct"),
+        "per_bias": per_bias,
     }
 
 
@@ -326,6 +420,14 @@ def _fmt_metrics_block(title: str, m: Dict[str, Any]) -> str:
             for b in m["reliability"]
         )
         lines.append(f"    可靠性  : {rel}")
+    ch = m.get("channel") or {}
+    if ch.get("n"):
+        lines.append(f"    通道    : 已评 {ch['n']}  含纳 {s(ch.get('avg_containment'))}  "
+                     f"bias命中 {s(ch.get('bias_hit_rate'))}  "
+                     f"上沿MAE {s(ch.get('upper_mae_pct'))}  下沿MAE {s(ch.get('lower_mae_pct'))}")
+        if ch.get("per_bias"):
+            pb = "  ".join(f"{b}:{v['hit_rate']}%(n{v['n']})" for b, v in ch["per_bias"].items())
+            lines.append(f"    通道分类: {pb}")
     return "\n".join(lines)
 
 

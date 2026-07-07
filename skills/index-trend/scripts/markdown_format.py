@@ -31,6 +31,21 @@ def _index_block(r: Dict[str, Any]) -> str:
     er = fc["expected_range"]
     lines.append(f"| 预期波动带 | {er['low']} ~ {er['high']} |")
     lines.append("")
+
+    # 上下沿通道
+    ch = r.get("channel") or {}
+    if ch.get("available"):
+        j = ch.get("judgement", {})
+        pos_pct = int(round(ch["pos_in_channel"] * 100))
+        lines.append(f"**上下沿通道**（{ch['type']} · {ch['direction']} · r²={ch['r2']} · 近{ch['lookback']}日）")
+        lines.append("")
+        lines.append("| 上沿(阻力) | 中轨 | 下沿(支撑) | 当前位置 | 判断 |")
+        lines.append("|------|------|------|------|------|")
+        lines.append(f"| {ch['upper']} | {ch['mid']} | {ch['lower']} | {pos_pct}% | "
+                     f"**{j.get('bias','?')}**({j.get('confidence','?')}) |")
+        lines.append(f"> {j.get('reason','')}")
+        lines.append("")
+
     lines.append(f"**未来 {fc['horizon_days'][0]}-{fc['horizon_days'][1]} 交易日情景**")
     lines.append("")
     lines.append("| | 情景 | 概率 | 目标区间 | 触发 |")

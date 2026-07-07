@@ -35,6 +35,7 @@ import trend_state as _trend  # noqa: E402
 import volume_price as _vp  # noqa: E402
 import forecast as _forecast  # noqa: E402
 import calibration as _calib  # noqa: E402
+import channel as _channel  # noqa: E402
 import prediction_log as _ledger  # noqa: E402
 import notifier as _notifier  # noqa: E402
 
@@ -67,8 +68,10 @@ def _fetch_df(index_key: str, days: int):
 
 def analyze_index(index_key: str, *, horizon: int = 7, days: int = 120,
                   swing_threshold: float = 3.0, calibrate: bool = True,
+                  channel_lookback: int = 40, channel_k: float = 2.0,
+                  channel_r2: float = 0.5,
                   ledger_records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """单指数完整分析：趋势 → 量价 → 原始情景 → 历史校准 → result。"""
+    """单指数完整分析：趋势 → 量价 → 上下沿通道 → 原始情景 → 历史校准 → result。"""
     cfg = INDEX_CONFIG[index_key]
     df = _fetch_df(index_key, days)
     if df is None:
@@ -78,6 +81,9 @@ def analyze_index(index_key: str, *, horizon: int = 7, days: int = 120,
     current = round(float(df["close"].iloc[-1]), 2)
     trend = _trend.analyze_trend(df, swing_threshold=swing_threshold)
     vp = _vp.analyze_volume_price(df, trend["direction"])
+    ch = _channel.compute_channel(df, lookback=channel_lookback,
+                                  k=channel_k, trend_r2=channel_r2)
+    ch["judgement"] = _channel.judge_breakout(ch, vp)
     raw = _forecast.build_forecast(df, trend, vp, horizon=horizon)
 
     calibration_meta = {"applied": False, "n_samples": 0}
@@ -100,6 +106,7 @@ def analyze_index(index_key: str, *, horizon: int = 7, days: int = 120,
         "current_price": current,
         "trend": trend_slim,
         "volume_price": vp,
+        "channel": ch,
         "key_levels": forecast.get("key_levels"),
         "forecast": {k: v for k, v in forecast.items() if k != "key_levels"},
         "forecast_raw": {k: v for k, v in raw.items() if k != "key_levels"} if calibrate else None,
@@ -140,6 +147,19 @@ def format_result(r: Dict[str, Any], verbose: bool = False) -> str:
                  f"量比: {vp['vol_ratio']}  量能: {vp['vol_trend']}")
     lines.append(f"  信号: {' / '.join(vp['signals'])}")
 
+    ch = r.get("channel") or {}
+    lines.append(f"\n--- 上下沿通道 ---")
+    if ch.get("available"):
+        j = ch.get("judgement", {})
+        pos_pct = int(round(ch["pos_in_channel"] * 100))
+        lines.append(f"  类型: {ch['type']}({ch['direction']}, r²={ch['r2']})  "
+                     f"近{ch['lookback']}日  带宽{ch['width_pct']}%")
+        lines.append(f"  上沿(阻力): {ch['upper']}   中轨: {ch['mid']}   下沿(支撑): {ch['lower']}")
+        lines.append(f"  当前价 {ch['current_price']}   位置 {pos_pct}%")
+        lines.append(f"  判断: {j.get('bias','?')}({j.get('confidence','?')})  —  {j.get('reason','')}")
+    else:
+        lines.append(f"  （{ch.get('reason', '数据不足')}，暂无通道）")
+
     lines.append(f"\n--- 走势推演 (未来{fc['horizon_days'][0]}-{fc['horizon_days'][1]}交易日) ---")
     er = fc["expected_range"]
     lines.append(f"  预期波动带: {er['low']} ~ {er['high']}  (ATR={fc['atr']})")
@@ -169,8 +189,9 @@ def format_result(r: Dict[str, Any], verbose: bool = False) -> str:
 
 def format_summary(results: List[Dict[str, Any]]) -> str:
     lines = ["\n" + "=" * 72, "  指数趋势推演 总览", "=" * 72, ""]
-    lines.append(f"  {'指数':<8} {'方向':<6} {'强度':<8} {'健康':<6} {'主情景(概率)':<18} {'目标区间':<18}")
-    lines.append(f"  {'-'*72}")
+    lines.append(f"  {'指数':<8} {'方向':<6} {'强度':<8} {'健康':<6} {'主情景(概率)':<18} "
+                 f"{'目标区间':<18} {'通道位置/判断':<16}")
+    lines.append(f"  {'-'*88}")
     for r in results:
         if r.get("error"):
             lines.append(f"  {r.get('index_name', r.get('index_key','?')):<8} ERROR {r['error']}")
@@ -182,10 +203,15 @@ def format_summary(results: List[Dict[str, Any]]) -> str:
         dir_cell = _DIR_CN[t["direction"]] + _DIR_ARROW[t["direction"]]
         strength_cell = f"{t['strength']}({t['strength_label']})"
         primary_cell = f"{primary['name']}({primary['probability']}%)"
+        ch = r.get("channel") or {}
+        if ch.get("available"):
+            ch_cell = f"{int(round(ch['pos_in_channel']*100))}% {ch.get('judgement',{}).get('bias','')}"
+        else:
+            ch_cell = "-"
         lines.append(
             f"  {r['index_name']:<8} {dir_cell:<6} {strength_cell:<8} "
             f"{r['volume_price']['health_score']:<6} {primary_cell:<18} "
-            f"{tr['low']}~{tr['high']}"
+            f"{tr['low']}~{tr['high']:<12} {ch_cell:<16}"
         )
     return "\n".join(lines)
 
@@ -209,6 +235,10 @@ def main():
     parser.add_argument("--horizon", type=int, default=7, help="预测跨度(交易日, 默认7)")
     parser.add_argument("--days", type=int, default=120, help="分析窗口交易日(默认120)")
     parser.add_argument("--swing-threshold", type=float, default=3.0, help="zigzag 幅度过滤%%(默认3.0)")
+    parser.add_argument("--channel-lookback", type=int, default=40, help="上下沿通道回溯交易日(默认40)")
+    parser.add_argument("--channel-k", type=float, default=2.0, help="回归通道带宽=k*残差σ(默认2.0)")
+    parser.add_argument("--channel-r2", type=float, default=0.5,
+                        help="r²≥此值用回归通道, 否则水平箱体(默认0.5)")
     parser.add_argument("--no-calibration", action="store_true", help="关闭历史校准")
     parser.add_argument("--review", action="store_true", help="只评估历史台账、出命中率/校准报告")
     parser.add_argument("--review-days", type=int, default=0, help="review 只看最近 N 条(0=全部)")
@@ -250,6 +280,8 @@ def main():
             r = analyze_index(idx, horizon=args.horizon, days=args.days,
                               swing_threshold=args.swing_threshold,
                               calibrate=not args.no_calibration,
+                              channel_lookback=args.channel_lookback,
+                              channel_k=args.channel_k, channel_r2=args.channel_r2,
                               ledger_records=ledger_records)
         except Exception as e:
             r = {"error": str(e), "index_key": idx, "index_name": INDEX_CONFIG[idx]["name"]}
