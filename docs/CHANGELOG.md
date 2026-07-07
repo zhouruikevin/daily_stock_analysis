@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 新增 `index-trend` skill：A股主要指数（sh/sz/cy/kc）趋势与量价概率化走势预测——以“市场是对的”为先验顺势外推，量价健康度定置信、关键位定路径，输出未来 5-10 交易日 顺势延续/震荡回踩/趋势反转 三情景（各带概率+目标区间）；内建预测台账（`skills/index-trend/ledger/predictions.jsonl`，入 git），每次跑落预测并回填 T+1 与 horizon 末真实走势，用历史命中率对后续预测做有界收缩式校准；CLI 支持 `--indices/--horizon/--review/--backfill-only/--no-calibration/--json` 等；与 `index-analysis`（顶背离+关键位）互补。
 - [新功能] `AkshareFetcher` 新增 `get_index_daily(symbol, start_date, end_date, include_today)`，在盘后历史日线接口未刷新当日数据时自动用新浪 spot 拼接当日 OHLCV，便于盘后做完整技术分析。
 - [新功能] `TushareFetcher` 新增 `get_index_daily`，复用 Pro `index_daily`/`rt_idx_k` 接口，输出口径（volume=股、amount=元）与 akshare 实现完全对齐；配置 `TUSHARE_TOKEN` 后由数据源管理器优先调用。
 - [新功能] `DataFetcherManager` 新增 `get_index_daily` 多源 fallback：按 priority 顺序依次询问各 fetcher，首选 Tushare（付费稳定）→ 失败/未配置自动降级 akshare，对调用方零感知。

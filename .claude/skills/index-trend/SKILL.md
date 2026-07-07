@@ -1,0 +1,1 @@
+../../../skills/index-trend/SKILL.md
