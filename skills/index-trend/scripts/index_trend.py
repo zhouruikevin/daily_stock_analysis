@@ -30,6 +30,14 @@ if str(_PROJECT_ROOT) not in sys.path:
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+# 加载项目 .env（与主项目 src/config.py 一致），使 EMAIL_* / TUSHARE_TOKEN 等
+# 在独立运行本脚本时也能生效；未装 dotenv 或无 .env 时静默跳过。
+try:
+    from dotenv import load_dotenv  # noqa: E402
+    load_dotenv(_PROJECT_ROOT / ".env")
+except Exception:
+    pass
+
 from data_provider import DataFetcherManager  # noqa: E402
 import trend_state as _trend  # noqa: E402
 import volume_price as _vp  # noqa: E402
