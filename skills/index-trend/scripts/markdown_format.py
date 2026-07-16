@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional
 _DIR_EMOJI = {"up": "📈", "down": "📉", "range": "➡️"}
 _DIR_CN = {"up": "上升", "down": "下降", "range": "震荡"}
 _SCENARIO_EMOJI = {"continuation": "🟢", "consolidation": "🟡", "reversal": "🔴"}
+_ACTION_EMOJI = {"强狙击": "🎯", "建仓": "🟢", "持有": "⚪",
+                 "减仓": "🟠", "清仓": "🔴", "观望": "👀"}
 
 
 def _index_block(r: Dict[str, Any]) -> str:
@@ -46,6 +48,29 @@ def _index_block(r: Dict[str, Any]) -> str:
         lines.append(f"> {j.get('reason','')}")
         lines.append("")
 
+    # 狙击/离场信号
+    sig = r.get("signals")
+    if sig:
+        act = sig.get("action", "观望")
+        ae = _ACTION_EMOJI.get(act, "")
+        lines.append(f"**狙击/离场信号** {ae} **{act}**"
+                     f"（置信 {sig.get('confidence')}/{sig.get('confidence_label')}"
+                     + (f" · {sig['setup_type']}" if sig.get('setup_type') else "") + "）")
+        lines.append("")
+        ez = sig.get("entry_zone")
+        if ez:
+            lines.append("| 狙击买入区 | 触发确认 | 止损 | 目标1 | 目标2 | 盈亏比 |")
+            lines.append("|------|------|------|------|------|------|")
+            lines.append(f"| {ez['low']}~{ez['high']} | {sig.get('trigger_price','-')} | "
+                         f"{sig.get('stop','-')} | {sig.get('target1','-')} | "
+                         f"{sig.get('target2','-')} | {sig.get('rr1','-')} |")
+        elif sig.get("reduce_zone"):
+            rz = sig["reduce_zone"]
+            extra = f" · 防守止损 {sig['stop']}" if (act == "清仓" and sig.get("stop") is not None) else ""
+            lines.append(f"> 减仓/止盈区 **{rz['low']}~{rz['high']}**{extra}")
+        lines.append(f"> 💡 {sig.get('note','')}")
+        lines.append("")
+
     lines.append(f"**未来 {fc['horizon_days'][0]}-{fc['horizon_days'][1]} 交易日情景**")
     lines.append("")
     lines.append("| | 情景 | 概率 | 目标区间 | 触发 |")
@@ -71,20 +96,23 @@ def _index_block(r: Dict[str, Any]) -> str:
 
 
 def _overview_table(results: List[Dict[str, Any]]) -> str:
-    lines = ["## 总览", "", "| 指数 | 方向 | 强度 | 健康 | 主情景 | 概率 | 目标区间 |",
-             "|------|------|------|------|--------|------|----------|"]
+    lines = ["## 总览", "", "| 指数 | 方向 | 强度 | 健康 | 主情景 | 概率 | 目标区间 | 动作 |",
+             "|------|------|------|------|--------|------|----------|------|"]
     for r in results:
         if r.get("error"):
-            lines.append(f"| {r.get('index_name', '?')} | ERROR | | | {r['error']} | | |")
+            lines.append(f"| {r.get('index_name', '?')} | ERROR | | | {r['error']} | | | |")
             continue
         t, fc = r["trend"], r["forecast"]
         primary = next((s for s in fc["scenarios"] if s["type"] == fc["primary_scenario"]),
                        fc["scenarios"][0])
         tr = primary["target_range"]
         emoji = _DIR_EMOJI.get(t["direction"], "")
+        sig = r.get("signals") or {}
+        act = sig.get("action", "-")
+        act_cell = f"{_ACTION_EMOJI.get(act, '')}{act}"
         lines.append(f"| {r['index_name']} | {emoji}{_DIR_CN[t['direction']]} "
                      f"| {t['strength']}({t['strength_label']}) | {r['volume_price']['health_score']} "
-                     f"| {primary['name']} | **{primary['probability']}%** | {tr['low']}~{tr['high']} |")
+                     f"| {primary['name']} | **{primary['probability']}%** | {tr['low']}~{tr['high']} | {act_cell} |")
     lines.append("")
     return "\n".join(lines)
 

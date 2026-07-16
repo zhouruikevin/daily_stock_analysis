@@ -104,9 +104,30 @@ def build_record(result: Dict[str, Any], today: Optional[str] = None) -> Optiona
         "scenarios_prob": {s["type"]: s.get("probability") for s in scenarios},
         "calibration": result.get("calibration"),
         "channel": _channel_snapshot(result.get("channel")),
+        "signals": _signal_snapshot(result.get("signals")),
         "outcome_t1": None,
         "outcome_horizon": None,
         "channel_outcome": None,
+        "signal_outcome": None,
+    }
+
+
+def _signal_snapshot(sig: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """从 result["signals"] 抽出台账要存的信号快照（回填/统计所需字段）。"""
+    if not sig:
+        return None
+    return {
+        "action": sig.get("action"),
+        "setup_type": sig.get("setup_type"),
+        "confidence": sig.get("confidence"),
+        "confidence_label": sig.get("confidence_label"),
+        "entry_zone": sig.get("entry_zone"),
+        "trigger_price": sig.get("trigger_price"),
+        "stop": sig.get("stop"),
+        "target1": sig.get("target1"),
+        "target2": sig.get("target2"),
+        "reduce_zone": sig.get("reduce_zone"),
+        "rr1": sig.get("rr1"),
     }
 
 
@@ -199,6 +220,74 @@ def _eval_channel(ch: Dict[str, Any], window: "pd.DataFrame",
     }
 
 
+def _eval_signal(sig: Optional[Dict[str, Any]], window: "pd.DataFrame") -> Optional[Dict[str, Any]]:
+    """仅做多：若进场类信号在 horizon 窗口内触发买入，判先触目标还是先触止损。
+
+    保守假设：同 bar 双触（low<=stop 且 high>=target）→ 记 stop。
+    非进场信号(持有/减仓/清仓/观望)记 evaluated=False，仅供动作分布统计。
+    """
+    if not sig:
+        return None
+    if sig.get("action") not in ("强狙击", "建仓"):
+        return {"evaluated": False, "action": sig.get("action"), "setup_type": sig.get("setup_type")}
+    ez = sig.get("entry_zone")
+    stop = sig.get("stop")
+    t1 = sig.get("target1")
+    t2 = sig.get("target2")
+    setup = sig.get("setup_type")
+    if not ez or stop is None:
+        return {"evaluated": False, "action": sig.get("action"), "reason": "价位缺失"}
+    rows = list(window.itertuples())
+    if not rows:
+        return {"evaluated": True, "entry_triggered": False}
+
+    # 1) 进场触发
+    entry_i = None
+    entry_px = None
+    for i, r in enumerate(rows):
+        if setup == "突破":
+            if float(r.high) >= sig.get("trigger_price", ez["high"]):
+                entry_i, entry_px = i, sig.get("trigger_price", ez["high"])
+                break
+        else:  # 低吸 / 试探
+            if float(r.low) <= ez["high"]:
+                entry_i, entry_px = i, round(min(ez["high"], float(r.high)), 2)
+                break
+    if entry_i is None:
+        return {"evaluated": True, "entry_triggered": False,
+                "action": sig.get("action"), "setup_type": setup}
+
+    # 2) 出场：进场之后逐 bar，先触止损还是先触目标（同 bar 双触 → 保守判 stop）
+    exit_reason = exit_px = exit_date = None
+    for r in rows[entry_i:]:
+        if float(r.low) <= stop:
+            exit_reason, exit_px = "stop", stop
+        elif t2 is not None and float(r.high) >= t2:
+            exit_reason, exit_px = "target2", t2
+        elif t1 is not None and float(r.high) >= t1:
+            exit_reason, exit_px = "target1", t1
+        if exit_reason:
+            exit_date = str(getattr(r, "date", ""))[:10]
+            break
+    if exit_reason is None:                       # 窗口末仍持有 → 末收盘平
+        last = rows[-1]
+        exit_reason, exit_px = "timeout", float(last.close)
+        exit_date = str(getattr(last, "date", ""))[:10]
+
+    pnl_pct = (exit_px - entry_px) / entry_px * 100 if entry_px else 0.0
+    risk = entry_px - stop
+    r_mult = round((exit_px - entry_px) / risk, 2) if risk > 0 else None
+    return {
+        "evaluated": True, "entry_triggered": True,
+        "action": sig.get("action"), "setup_type": setup,
+        "entry_date": str(getattr(rows[entry_i], "date", ""))[:10],
+        "entry_price": round(entry_px, 2),
+        "exit_reason": exit_reason, "exit_price": round(exit_px, 2), "exit_date": exit_date,
+        "pnl_pct": round(pnl_pct, 2),
+        "r_multiple": r_mult, "win": pnl_pct > 0,
+    }
+
+
 def backfill(index_dfs: Dict[str, pd.DataFrame], path: Optional[Path] = None) -> int:
     """用最新行情回填未评估的旧预测。index_dfs: {index_key: df(date/OHLC 升序)}。
 
@@ -268,6 +357,9 @@ def backfill(index_dfs: Dict[str, pd.DataFrame], path: Optional[Path] = None) ->
             ch = rec.get("channel")
             if ch and rec.get("channel_outcome") is None:
                 rec["channel_outcome"] = _eval_channel(ch, window, close, hi, lo, base)
+            # 信号评估（同 horizon 窗口，仅做多）
+            if rec.get("signal_outcome") is None:
+                rec["signal_outcome"] = _eval_signal(rec.get("signals"), window)
             changed += 1
 
     if changed:
@@ -317,6 +409,48 @@ def evaluate(records: List[Dict[str, Any]], index_key: Optional[str] = None) -> 
         "horizon_bias_pct": _bias(hz),
         "reliability": _reliability(recs),
         "channel": _eval_channel_metrics(co),
+        "signal": _eval_signal_metrics([r["signal_outcome"] for r in recs if r.get("signal_outcome")]),
+    }
+
+
+def _eval_signal_metrics(so: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """信号评估聚合：触发率 / 胜率 / 盈亏比 / Profit Factor / 期望R / 分动作 / 分形态。"""
+    if not so:
+        return {"n": 0}
+    entries = [x for x in so if x.get("evaluated") and "entry_triggered" in x]
+    triggered = [x for x in entries if x.get("entry_triggered")]
+    wins = [x for x in triggered if x.get("win")]
+    losses = [x for x in triggered if x.get("win") is False]
+    sum_win = sum(x["pnl_pct"] for x in wins if x.get("pnl_pct") is not None)
+    sum_loss = sum(x["pnl_pct"] for x in losses if x.get("pnl_pct") is not None)
+    avg_win = round(sum_win / len(wins), 2) if wins else None
+    avg_loss = round(sum_loss / len(losses), 2) if losses else None
+    r_vals = [x["r_multiple"] for x in triggered if x.get("r_multiple") is not None]
+
+    # 分动作分布（含非进场）
+    per_action: Dict[str, int] = {}
+    for x in so:
+        a = x.get("action") or "?"
+        per_action[a] = per_action.get(a, 0) + 1
+    # 分形态胜率（仅已触发进场）
+    per_setup: Dict[str, Dict[str, Any]] = {}
+    for x in triggered:
+        b = per_setup.setdefault(x.get("setup_type") or "?", {"n": 0, "wins": 0})
+        b["n"] += 1
+        b["wins"] += 1 if x.get("win") else 0
+    for b in per_setup.values():
+        b["win_rate"] = round(b["wins"] / b["n"] * 100, 1) if b["n"] else None
+
+    return {
+        "n": len(so), "n_entry": len(entries), "n_triggered": len(triggered),
+        "trigger_rate": round(len(triggered) / len(entries) * 100, 1) if entries else None,
+        "win_rate": round(len(wins) / len(triggered) * 100, 1) if triggered else None,
+        "avg_win_pct": avg_win, "avg_loss_pct": avg_loss,
+        "payoff_ratio": round(avg_win / abs(avg_loss), 2) if (avg_win and avg_loss) else None,
+        "profit_factor": round(sum_win / abs(sum_loss), 2) if sum_loss != 0 else (
+            None if sum_win == 0 else float("inf")),
+        "avg_r": round(sum(r_vals) / len(r_vals), 2) if r_vals else None,
+        "per_action": per_action, "per_setup": per_setup,
     }
 
 
@@ -428,6 +562,26 @@ def _fmt_metrics_block(title: str, m: Dict[str, Any]) -> str:
         if ch.get("per_bias"):
             pb = "  ".join(f"{b}:{v['hit_rate']}%(n{v['n']})" for b, v in ch["per_bias"].items())
             lines.append(f"    通道分类: {pb}")
+    sg = m.get("signal") or {}
+    if sg.get("n"):
+        def sf(v, suf=""):
+            if v is None:
+                return "-"
+            return "∞" if v == float("inf") else f"{v}{suf}"
+        lines.append(f"    信号    : 进场 {sg.get('n_entry',0)} (触发 {sg.get('n_triggered',0)}, "
+                     f"触发率 {sf(sg.get('trigger_rate'),'%')})  胜率 {sf(sg.get('win_rate'),'%')}  "
+                     f"盈亏比 {sf(sg.get('payoff_ratio'))}  PF {sf(sg.get('profit_factor'))}  "
+                     f"avgR {sf(sg.get('avg_r'))}")
+        if sg.get("per_setup"):
+            ps = "  ".join(f"{k} {sf(v.get('win_rate'),'%')}(n{v['n']})"
+                           for k, v in sg["per_setup"].items())
+            lines.append(f"    信号分类: {ps}")
+        # 只读调参诊断（不自动改常量）：某形态样本够且亏钱 → 提示
+        for k, v in (sg.get("per_setup") or {}).items():
+            pf = sg.get("profit_factor")
+            if v["n"] >= 20 and (v.get("win_rate") or 0) < 40:
+                lines.append(f"    ⚠ 诊断: 形态[{k}] 胜率偏低(n{v['n']})，"
+                             f"考虑上调 signals.CONF_STRONG 或加 rr1≥1.5 过滤后 --backtest 复核")
     return "\n".join(lines)
 
 

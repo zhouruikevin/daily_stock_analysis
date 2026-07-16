@@ -44,6 +44,8 @@ import volume_price as _vp  # noqa: E402
 import forecast as _forecast  # noqa: E402
 import calibration as _calib  # noqa: E402
 import channel as _channel  # noqa: E402
+import signals as _signals  # noqa: E402
+import backtest as _backtest  # noqa: E402
 import prediction_log as _ledger  # noqa: E402
 import notifier as _notifier  # noqa: E402
 
@@ -77,7 +79,7 @@ def _fetch_df(index_key: str, days: int):
 def analyze_index(index_key: str, *, horizon: int = 7, days: int = 120,
                   swing_threshold: float = 3.0, calibrate: bool = True,
                   channel_lookback: int = 40, channel_k: float = 2.0,
-                  channel_r2: float = 0.5,
+                  channel_r2: float = 0.5, with_signals: bool = True,
                   ledger_records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """单指数完整分析：趋势 → 量价 → 上下沿通道 → 原始情景 → 历史校准 → result。"""
     cfg = INDEX_CONFIG[index_key]
@@ -122,6 +124,8 @@ def analyze_index(index_key: str, *, horizon: int = 7, days: int = 120,
         "_pivots": trend.get("pivots"),  # 内部用，JSON 精简时剔除
         "error": None,
     }
+    # 狙击/离场信号：把已算好的 trend/量价/通道/关键位 翻译成动作+价位
+    result["signals"] = _signals.build_signals(result, df) if with_signals else None
     return result
 
 
@@ -130,6 +134,44 @@ def analyze_index(index_key: str, *, horizon: int = 7, days: int = 120,
 # ============================================================
 _DIR_CN = {"up": "上升", "down": "下降", "range": "震荡"}
 _DIR_ARROW = {"up": "↗", "down": "↘", "range": "→"}
+_ACTION_EMOJI = {"强狙击": "🎯", "建仓": "🟢", "持有": "⚪",
+                 "减仓": "🟠", "清仓": "🔴", "观望": "👀"}
+
+
+def _format_signal_lines(sig: Dict[str, Any]) -> str:
+    """把 signals dict 渲染成终端文本（观望/离场类精简，进场类给全套价位）。"""
+    act = sig.get("action", "观望")
+    emoji = _ACTION_EMOJI.get(act, "")
+    head = (f"  {emoji} 动作: {act}  置信: {sig.get('confidence')}"
+            f"({sig.get('confidence_label')})")
+    setup = sig.get("setup_type")
+    if setup:
+        head += f"  形态: {setup}"
+    out = [head]
+    ez = sig.get("entry_zone")
+    if ez:
+        line = f"  狙击买入区: {ez['low']}~{ez['high']}"
+        if sig.get("trigger_price") is not None:
+            line += f"  触发确认: {sig['trigger_price']}"
+        if sig.get("stop") is not None:
+            line += f"  止损: {sig['stop']}"
+        out.append(line)
+        tl = f"  目标1: {sig.get('target1')}"
+        if sig.get("target2") is not None:
+            tl += f"   目标2: {sig['target2']}"
+        if sig.get("rr1") is not None:
+            tl += f"   盈亏比: {sig['rr1']}"
+        out.append(tl)
+    rz = sig.get("reduce_zone")
+    if rz:
+        line = f"  减仓/止盈区: {rz['low']}~{rz['high']}"
+        if act == "清仓" and sig.get("stop") is not None:
+            line += f"  防守止损: {sig['stop']}"
+        out.append(line)
+    elif act == "清仓" and sig.get("stop") is not None:
+        out.append(f"  防守止损: {sig['stop']}")
+    out.append(f"  说明: {sig.get('note', '')}")
+    return "\n".join(out)
 
 
 def format_result(r: Dict[str, Any], verbose: bool = False) -> str:
@@ -168,6 +210,11 @@ def format_result(r: Dict[str, Any], verbose: bool = False) -> str:
     else:
         lines.append(f"  （{ch.get('reason', '数据不足')}，暂无通道）")
 
+    sig = r.get("signals")
+    if sig:
+        lines.append(f"\n--- 狙击/离场信号 ---")
+        lines.append(_format_signal_lines(sig))
+
     lines.append(f"\n--- 走势推演 (未来{fc['horizon_days'][0]}-{fc['horizon_days'][1]}交易日) ---")
     er = fc["expected_range"]
     lines.append(f"  预期波动带: {er['low']} ~ {er['high']}  (ATR={fc['atr']})")
@@ -198,8 +245,8 @@ def format_result(r: Dict[str, Any], verbose: bool = False) -> str:
 def format_summary(results: List[Dict[str, Any]]) -> str:
     lines = ["\n" + "=" * 72, "  指数趋势推演 总览", "=" * 72, ""]
     lines.append(f"  {'指数':<8} {'方向':<6} {'强度':<8} {'健康':<6} {'主情景(概率)':<18} "
-                 f"{'目标区间':<18} {'通道位置/判断':<16}")
-    lines.append(f"  {'-'*88}")
+                 f"{'目标区间':<18} {'动作':<8} {'狙击区/止损':<20}")
+    lines.append(f"  {'-'*100}")
     for r in results:
         if r.get("error"):
             lines.append(f"  {r.get('index_name', r.get('index_key','?')):<8} ERROR {r['error']}")
@@ -211,15 +258,23 @@ def format_summary(results: List[Dict[str, Any]]) -> str:
         dir_cell = _DIR_CN[t["direction"]] + _DIR_ARROW[t["direction"]]
         strength_cell = f"{t['strength']}({t['strength_label']})"
         primary_cell = f"{primary['name']}({primary['probability']}%)"
-        ch = r.get("channel") or {}
-        if ch.get("available"):
-            ch_cell = f"{int(round(ch['pos_in_channel']*100))}% {ch.get('judgement',{}).get('bias','')}"
+        sig = r.get("signals") or {}
+        act = sig.get("action", "-")
+        act_cell = f"{_ACTION_EMOJI.get(act, '')}{act}"
+        ez = sig.get("entry_zone")
+        if ez:
+            sig_cell = f"{ez['low']}~{ez['high']}"
+            if sig.get("stop") is not None:
+                sig_cell += f"/{sig['stop']}"
+        elif sig.get("reduce_zone"):
+            rz = sig["reduce_zone"]
+            sig_cell = f"减{rz['low']}~{rz['high']}"
         else:
-            ch_cell = "-"
+            sig_cell = "-"
         lines.append(
             f"  {r['index_name']:<8} {dir_cell:<6} {strength_cell:<8} "
             f"{r['volume_price']['health_score']:<6} {primary_cell:<18} "
-            f"{tr['low']}~{tr['high']:<12} {ch_cell:<16}"
+            f"{tr['low']}~{tr['high']:<12} {act_cell:<8} {sig_cell:<20}"
         )
     return "\n".join(lines)
 
@@ -251,6 +306,11 @@ def main():
     parser.add_argument("--review", action="store_true", help="只评估历史台账、出命中率/校准报告")
     parser.add_argument("--review-days", type=int, default=0, help="review 只看最近 N 条(0=全部)")
     parser.add_argument("--backfill-only", action="store_true", help="只回填旧预测真实走势, 不做新预测")
+    parser.add_argument("--backtest", action="store_true",
+                        help="历史回放回测：逐日 replay 信号+模拟买卖, 出胜率/收益/回撤")
+    parser.add_argument("--backtest-months", type=int, default=6,
+                        help="回测回放最近 N 个月(≈N*21 交易日, 默认6)")
+    parser.add_argument("--no-signals", action="store_true", help="关闭狙击/离场信号生成与展示")
     parser.add_argument("--no-save", action="store_true", help="不写台账/不回填")
     parser.add_argument("--no-email", action="store_true", help="不发邮件")
     parser.add_argument("--verbose", action="store_true", help="附摆动枢轴/原始预测")
@@ -266,6 +326,28 @@ def main():
     # --- review 模式：只出评估报告 ---
     if args.review:
         print(_ledger.format_review(index_keys=indices))
+        return
+
+    # --- backtest 模式：历史回放回测 ---
+    if args.backtest:
+        warmup = max(args.channel_lookback, 60)
+        need_days = args.backtest_months * 21 + warmup + args.horizon + 5
+        for idx in indices:
+            print(f"正在回测 {INDEX_CONFIG[idx]['name']} ...", file=sys.stderr)
+            df = _fetch_df(idx, need_days)
+            if df is None:
+                print(f"❌ {INDEX_CONFIG[idx]['name']}: 无法获取数据")
+                continue
+            rep = _backtest.run_backtest(
+                idx, df, index_name=INDEX_CONFIG[idx]["name"],
+                horizon=args.horizon, channel_lookback=args.channel_lookback,
+                channel_k=args.channel_k, channel_r2=args.channel_r2,
+                swing_threshold=args.swing_threshold, months=args.backtest_months,
+            )
+            if args.json_output:
+                print(json.dumps(rep, ensure_ascii=False, indent=2))
+            else:
+                print(_backtest.format_backtest(rep))
         return
 
     # --- backfill-only：只回填 ---
@@ -290,6 +372,7 @@ def main():
                               calibrate=not args.no_calibration,
                               channel_lookback=args.channel_lookback,
                               channel_k=args.channel_k, channel_r2=args.channel_r2,
+                              with_signals=not args.no_signals,
                               ledger_records=ledger_records)
         except Exception as e:
             r = {"error": str(e), "index_key": idx, "index_name": INDEX_CONFIG[idx]["name"]}
