@@ -143,6 +143,8 @@ class TushareFetcher(BaseFetcher):
         self._api: Optional[object] = None  # Tushare API 实例
         self.date_list: Optional[List[str]] = None  # 交易日列表缓存（倒序，最新日期在前）
         self._date_list_end: Optional[str] = None  # 缓存对应的截止日期，用于跨日刷新
+        # ETF 量比/换手率自算缓存：key=(normalized_code, end_date)，含 end_date 故跨交易日自然失效
+        self._etf_metrics_cache: Dict[Tuple[str, str], Tuple[Optional[float], Optional[float]]] = {}
 
         # 尝试初始化 API
         self._init_api()
@@ -688,7 +690,88 @@ class TushareFetcher(BaseFetcher):
             logger.warning(f"Tushare 获取股票列表失败: {e}")
 
         return None
-    
+
+    def _compute_etf_volume_metrics(
+        self, stock_code: str
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """用 fund_daily + fund_share 为 A 股 ETF 自算 (量比, 换手率)。
+
+        Tushare 的 daily_basic 不收 ETF、fund_daily 无量比/换手率列，故这里自算：
+        - 量比 = 当日 vol / 前 5 个交易日 vol 均值（同为「手」，同口径相除免换算）
+        - 换手率(%) = (vol×100) / (fd_share×10000) × 100
+          （fund_daily.vol 单位「手」→股 ×100；fund_share.fd_share 单位「万份」→份 ×10000）
+
+        盘中无可用实时量，取值以最近交易日 EOD 口径近似。任一数据缺失时对应指标降级为 None，
+        不抛异常。结果按 (归一化代码, 截止交易日) 缓存，避免同日重复调用 API。
+        """
+        if self._api is None or not _is_etf_code(stock_code):
+            return None, None
+
+        normalized_code = normalize_stock_code(stock_code)
+        trade_dates = self._get_trade_dates()  # 倒序，最新在前
+        if not trade_dates:
+            return None, None
+
+        end_date = trade_dates[0]
+        cache_key = (normalized_code, end_date)
+        if cache_key in self._etf_metrics_cache:
+            return self._etf_metrics_cache[cache_key]
+
+        # 取约 10 个交易日窗口以容错停牌/缺行（量比需当日 + 前 5 日 = 至少 6 个交易日）
+        start_date = trade_dates[min(len(trade_dates) - 1, 9)]
+        ts_code = self._convert_stock_code(stock_code)
+
+        volume_ratio: Optional[float] = None
+        turnover_rate: Optional[float] = None
+        vol_today: Optional[float] = None
+
+        # --- 量比：fund_daily 区间日线 ---
+        try:
+            df = self._call_api_with_rate_limit(
+                "fund_daily", ts_code=ts_code, start_date=start_date, end_date=end_date
+            )
+            if df is not None and not df.empty and "vol" in df.columns:
+                df = df.sort_values("trade_date")  # 升序，末行为最新交易日
+                vols = pd.to_numeric(df["vol"], errors="coerce").dropna()
+                if len(vols) >= 6:
+                    vol_today = float(vols.iloc[-1])
+                    avg5 = float(vols.iloc[-6:-1].mean())
+                    if avg5 > 0:
+                        volume_ratio = round(vol_today / avg5, 2)
+                elif len(vols) >= 1:
+                    # 历史不足 5 日：仍记录当日量供换手率使用，但量比降级 None
+                    vol_today = float(vols.iloc[-1])
+        except Exception as e:
+            logger.debug(f"[Tushare] ETF {stock_code} 量比自算失败: {e}")
+            return None, None
+
+        # --- 换手率：fund_share 份额 ---
+        if vol_today is not None:
+            try:
+                df_share = self._call_api_with_rate_limit(
+                    "fund_share", ts_code=ts_code, start_date=start_date, end_date=end_date
+                )
+                if df_share is not None and not df_share.empty and "fd_share" in df_share.columns:
+                    shares = pd.to_numeric(
+                        df_share.sort_values("trade_date")["fd_share"], errors="coerce"
+                    ).dropna()
+                    if len(shares) >= 1:
+                        fd_share = float(shares.iloc[-1])  # 万份
+                        if fd_share > 0:
+                            rate = (vol_today * 100) / (fd_share * 10000) * 100
+                            # sanity：换手率应在 (0, 100] 内，越界视为单位/数据异常并丢弃
+                            if 0 < rate <= 100:
+                                turnover_rate = round(rate, 2)
+                            else:
+                                logger.warning(
+                                    f"[Tushare] ETF {stock_code} 换手率自算越界({rate:.2f}%)，已丢弃"
+                                )
+            except Exception as e:
+                logger.debug(f"[Tushare] ETF {stock_code} 换手率自算失败: {e}")
+
+        self._etf_metrics_cache[cache_key] = (volume_ratio, turnover_rate)
+        return volume_ratio, turnover_rate
+
     def get_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取实时行情
@@ -712,6 +795,7 @@ class TushareFetcher(BaseFetcher):
             return None
 
         normalized_code = normalize_stock_code(stock_code)
+        is_etf = _is_etf_code(stock_code)
 
         from .realtime_types import (
             RealtimeSource,
@@ -720,6 +804,8 @@ class TushareFetcher(BaseFetcher):
 
         # 速率限制检查
         self._check_rate_limit()
+
+        quote: Optional[UnifiedRealtimeQuote] = None
 
         # 尝试 Pro 接口
         try:
@@ -731,7 +817,7 @@ class TushareFetcher(BaseFetcher):
                 row = df.iloc[0]
                 logger.debug(f"Tushare Pro 实时行情获取成功: {stock_code}")
 
-                return UnifiedRealtimeQuote(
+                quote = UnifiedRealtimeQuote(
                     code=normalized_code,
                     name=str(row.get('name', '')),
                     source=RealtimeSource.TUSHARE,
@@ -753,48 +839,105 @@ class TushareFetcher(BaseFetcher):
             # 仅记录调试日志，不报错，继续尝试降级
             logger.debug(f"Tushare Pro 实时行情不可用 (可能是积分不足): {e}")
 
-        # 降级：尝试旧版接口
+        # 降级：尝试旧版接口（仅当 Pro 未取到）
+        if quote is None:
+            try:
+                import tushare as ts
+
+                symbol = self._get_legacy_realtime_symbol(stock_code)
+
+                # 调用旧版实时接口 (ts.get_realtime_quotes)
+                df = ts.get_realtime_quotes(symbol)
+
+                if df is not None and not df.empty:
+                    row = df.iloc[0]
+
+                    # 计算涨跌幅
+                    price = safe_float(row['price'])
+                    pre_close = safe_float(row['pre_close'])
+                    change_pct = 0.0
+                    change_amount = 0.0
+
+                    if price and pre_close and pre_close > 0:
+                        change_amount = price - pre_close
+                        change_pct = (change_amount / pre_close) * 100
+
+                    # 构建统一对象
+                    quote = UnifiedRealtimeQuote(
+                        code=normalized_code,
+                        name=str(row['name']),
+                        source=RealtimeSource.TUSHARE,
+                        price=price,
+                        change_pct=round(change_pct, 2),
+                        change_amount=round(change_amount, 2),
+                        volume=safe_int(row['volume']) // 100,  # 转换为手
+                        amount=safe_float(row['amount']),
+                        high=safe_float(row['high']),
+                        low=safe_float(row['low']),
+                        open_price=safe_float(row['open']),
+                        pre_close=pre_close,
+                    )
+            except Exception as e:
+                # ETF 仍可用 fund_daily 兜底，故不在此直接返回 None
+                logger.warning(f"Tushare (旧版) 获取实时行情失败 {stock_code}: {e}")
+
+        # ETF：Tushare 无原生量比/换手率，用 fund_daily/fund_share 自算并回填；
+        # 镜像实时接口不可用时以 EOD 日线兜底构造 quote，使 Tushare 成为 ETF 完整数据源。
+        if is_etf:
+            if quote is None:
+                quote = self._build_etf_eod_quote(stock_code, normalized_code)
+            if quote is not None:
+                vr, tr = self._compute_etf_volume_metrics(stock_code)
+                if quote.volume_ratio is None and vr is not None:
+                    quote.volume_ratio = vr
+                if quote.turnover_rate is None and tr is not None:
+                    quote.turnover_rate = tr
+
+        return quote
+
+    def _build_etf_eod_quote(
+        self, stock_code: str, normalized_code: str
+    ) -> Optional[UnifiedRealtimeQuote]:
+        """镜像实时接口不可用时，用 fund_daily 最新一行为 ETF 构造最近收盘口径的 quote。
+
+        必须带 price>0 才能通过 DataFetcherManager 的 has_basic_data() 采纳门槛。
+        """
+        from .realtime_types import RealtimeSource, safe_float
+
         try:
-            import tushare as ts
-
-            symbol = self._get_legacy_realtime_symbol(stock_code)
-
-            # 调用旧版实时接口 (ts.get_realtime_quotes)
-            df = ts.get_realtime_quotes(symbol)
-
-            if df is None or df.empty:
+            trade_dates = self._get_trade_dates()
+            if not trade_dates:
+                return None
+            end_date = trade_dates[0]
+            start_date = trade_dates[min(len(trade_dates) - 1, 4)]
+            ts_code = self._convert_stock_code(stock_code)
+            df = self._call_api_with_rate_limit(
+                "fund_daily", ts_code=ts_code, start_date=start_date, end_date=end_date
+            )
+            if df is None or df.empty or "close" not in df.columns:
                 return None
 
-            row = df.iloc[0]
+            row = df.sort_values("trade_date").iloc[-1]
+            price = safe_float(row.get("close"))
+            if not price or price <= 0:
+                return None
 
-            # 计算涨跌幅
-            price = safe_float(row['price'])
-            pre_close = safe_float(row['pre_close'])
-            change_pct = 0.0
-            change_amount = 0.0
-
-            if price and pre_close and pre_close > 0:
-                change_amount = price - pre_close
-                change_pct = (change_amount / pre_close) * 100
-
-            # 构建统一对象
+            cached_name = getattr(self, "_stock_name_cache", {}).get(normalized_code, "")
             return UnifiedRealtimeQuote(
                 code=normalized_code,
-                name=str(row['name']),
+                name=cached_name,
                 source=RealtimeSource.TUSHARE,
                 price=price,
-                change_pct=round(change_pct, 2),
-                change_amount=round(change_amount, 2),
-                volume=safe_int(row['volume']) // 100,  # 转换为手
-                amount=safe_float(row['amount']),
-                high=safe_float(row['high']),
-                low=safe_float(row['low']),
-                open_price=safe_float(row['open']),
-                pre_close=pre_close,
+                change_pct=safe_float(row.get("pct_chg")),
+                change_amount=safe_float(row.get("change")),
+                amount=safe_float(row.get("amount")),
+                high=safe_float(row.get("high")),
+                low=safe_float(row.get("low")),
+                open_price=safe_float(row.get("open")),
+                pre_close=safe_float(row.get("pre_close")),
             )
-
         except Exception as e:
-            logger.warning(f"Tushare (旧版) 获取实时行情失败 {stock_code}: {e}")
+            logger.debug(f"[Tushare] ETF {stock_code} EOD 兜底 quote 构造失败: {e}")
             return None
 
     def get_main_indices(self, region: str = "cn") -> Optional[List[dict]]:
