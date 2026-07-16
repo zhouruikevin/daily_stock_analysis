@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] `TushareFetcher` 为 A 股 ETF 用 `fund_daily`/`fund_share` 自算量比与换手率并回填实时行情（量比=当日量/前5日均量，换手率=成交量/份额，含 0~100% sanity 校验），仅填缺失字段不覆盖 akshare/efinance 真实值；镜像实时接口不可用时以 EOD 日线兜底构造 quote，使 Tushare 成为 ETF 完整数据源（盘中为最近交易日 EOD 近似口径）。此前 ETF 报告量比/换手率恒为 N/A（Tushare 的 `daily_basic` 不收 ETF、`fund_daily` 无此列），东财实时快照又长期不可用。
+- [新功能] `index-trend` skill 新增「狙击/离场信号」（仅做多）：把趋势/量价/通道/关键位翻译成明确动作（强狙击/建仓/持有/减仓/清仓/观望）+ 价位（狙击买入区/触发确认/止损/目标1·2/减仓区/盈亏比），随预测落台账并按 horizon 窗口回填真实盈亏（进场触发/先触目标或止损/`r_multiple`/`win`，同 bar 双触保守判止损）；`--review` 汇总信号胜率/盈亏比/PF/期望R + 分形态命中 + 只读调参建议。新增历史回放回测 `--backtest`（`--backtest-months` 控窗口）：逐日用 `df.iloc[:t+1]` 切片重算信号（防未来函数）+ 模拟单一仓位买卖，输出胜率/盈亏比/最大回撤/总收益 vs 买入持有/超额；CLI 新增 `--no-signals`。信号阈值 v1 手动调参（不自动校准）。
 - [新功能] `index-trend` skill 新增自适应「上下沿通道」：有趋势(回归 r²≥阈值)用回归通道、震荡用水平箱体，给出上沿/下沿/当前位置 + 量价突破判断（突破上沿/跌破下沿/通道内震荡）；判断纳入预测台账，回填含纳率/bias命中率/边界误差供 `--review` 复盘；CLI 加 `--channel-lookback/--channel-k/--channel-r2`。
 - [新功能] 新增 `index-trend` skill：A股主要指数（sh/sz/cy/kc）趋势与量价概率化走势预测——以“市场是对的”为先验顺势外推，量价健康度定置信、关键位定路径，输出未来 5-10 交易日 顺势延续/震荡回踩/趋势反转 三情景（各带概率+目标区间）；内建预测台账（`skills/index-trend/ledger/predictions.jsonl`，入 git），每次跑落预测并回填 T+1 与 horizon 末真实走势，用历史命中率对后续预测做有界收缩式校准；CLI 支持 `--indices/--horizon/--review/--backfill-only/--no-calibration/--json` 等；与 `index-analysis`（顶背离+关键位）互补。
 - [新功能] `AkshareFetcher` 新增 `get_index_daily(symbol, start_date, end_date, include_today)`，在盘后历史日线接口未刷新当日数据时自动用新浪 spot 拼接当日 OHLCV，便于盘后做完整技术分析。
