@@ -23,7 +23,12 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 
 import pandas as pd
 
-from src.config import FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT, get_config, Config
+from src.config import (
+    FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT,
+    SINGLE_STOCK_ANALYSIS_TIMEOUT_DEFAULT,
+    get_config,
+    Config,
+)
 from src.storage import get_db
 from data_provider import DataFetcherManager
 from data_provider.base import is_bse_code, normalize_stock_code
@@ -361,7 +366,7 @@ class StockAnalysisPipeline:
         current_time: Optional[datetime] = None,
     ) -> Optional[AnalysisResult]:
         """
-        分析单只股票,带200秒整体超时保护
+        分析单只股票,带整体超时保护(默认200秒,由 SINGLE_STOCK_ANALYSIS_TIMEOUT 调整)
             
         任何环节(搜索、LLM、数据源)卡死都不会阻塞整个worker线程。
         超时后返回失败结果,确保批量分析任务继续执行。
@@ -389,19 +394,34 @@ class StockAnalysisPipeline:
             except Exception as e:
                 result_container["exception"] = e
             
+        # 单股整体分析超时。默认 200s 保持原行为；慢模型（如 opus-5 单次 LLM 约 160s）
+        # 叠加数据源抖动会顶爆预算，这类场景由调用方上调 SINGLE_STOCK_ANALYSIS_TIMEOUT。
+        # 显式校验类型：这里拿到非数值会让 join() 抛 TypeError，进而搞死整条分析链路，
+        # 所以宁可退回默认值并留下告警，也不让一个坏配置连带所有股票分析失败。
+        timeout_s = getattr(
+            get_config(), "single_stock_analysis_timeout",
+            SINGLE_STOCK_ANALYSIS_TIMEOUT_DEFAULT,
+        )
+        if not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool) or timeout_s <= 0:
+            logger.warning(
+                "[%s] single_stock_analysis_timeout=%r 不是正数，回落默认 %ds",
+                code, timeout_s, SINGLE_STOCK_ANALYSIS_TIMEOUT_DEFAULT,
+            )
+            timeout_s = SINGLE_STOCK_ANALYSIS_TIMEOUT_DEFAULT
+
         # 启动daemon线程执行分析
         analysis_thread = threading.Thread(target=_analyze_target, daemon=True)
         analysis_thread.start()
-        analysis_thread.join(timeout=200)  # 单股整体分析超时200秒
-            
+        analysis_thread.join(timeout=timeout_s)
+
         # 检查超时
         if analysis_thread.is_alive():
-            logger.error(f"[{code}] 分析超时(200s),强制跳过继续下一只股票")
+            logger.error(f"[{code}] 分析超时({timeout_s}s),强制跳过继续下一只股票")
             return AnalysisResult(
                 code=code,
                 name=stock_name,
                 success=False,
-                error_message="分析超时(200秒),已跳过",
+                error_message=f"分析超时({timeout_s}秒),已跳过",
                 sentiment_score=0,
                 trend_prediction="震荡",
                 operation_advice="观望",

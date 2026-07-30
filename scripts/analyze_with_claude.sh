@@ -1,5 +1,9 @@
 #!/bin/bash
-# 用 Claude(claude-opus-4-8) 经原分析管道分析股票，逐只反馈进度，最后发合并邮件。
+# 用 Claude 经原分析管道分析股票，逐只反馈进度，最后发合并邮件。
+# 模型：CLAUDE_PROXY_MODEL（默认 claude-opus-4-8），可用 CLAUDE_PROXY_MODEL=xxx 覆盖。
+# 默认选 opus-4-8 而非 opus-5：同 prompt 下单次 LLM 75s vs 141s，21 只整轮 12min vs 22min+，
+# 报告字段完整性一致（无占位补全）；opus-5 输出更详细但评分尺子更严，需要时显式覆盖。
+# 注意：网关当前仅放开 claude-opus-4-8 / claude-opus-5，sonnet/haiku 会 400 失败。
 #
 # 用法（在项目根目录执行）：
 #   bash scripts/analyze_with_claude.sh                 # 分析 .env 的 STOCK_LIST（关注列表）
@@ -27,8 +31,19 @@ if ! curl -s "${PROXY_URL}/health" >/dev/null 2>&1; then
     curl -s "${PROXY_URL}/health" >/dev/null 2>&1 && break
   done
 fi
-curl -s "${PROXY_URL}/health" >/dev/null 2>&1 || { echo "[claude] 代理启动失败，见 /tmp/claude_proxy.log"; exit 1; }
-echo "[claude] 代理就绪: $(curl -s ${PROXY_URL}/health)"
+HEALTH="$(curl -s "${PROXY_URL}/health" 2>/dev/null || true)"
+[ -n "$HEALTH" ] || { echo "[claude] 代理启动失败，见 /tmp/claude_proxy.log"; exit 1; }
+echo "[claude] 代理就绪: ${HEALTH}"
+
+# 代理是常驻进程，模型在启动那刻固化；复用已运行的代理时改 CLAUDE_PROXY_MODEL 不会生效。
+# 这里显式对比并告警，避免以为切了模型、实际还在用旧模型跑完整轮分析。
+RUNNING_MODEL="$(printf '%s' "$HEALTH" | sed -n 's/.*"model":"\([^"]*\)".*/\1/p')"
+if [ -n "$RUNNING_MODEL" ] && [ "$RUNNING_MODEL" != "$CLAUDE_PROXY_MODEL" ]; then
+  echo "[claude] ⚠️  代理正在用 ${RUNNING_MODEL}，本次期望 ${CLAUDE_PROXY_MODEL}"
+  echo "[claude] ⚠️  本轮分析仍会用 ${RUNNING_MODEL}；要切换请先停代理再重跑本脚本："
+  echo "[claude] ⚠️    pkill -f claude_llm_proxy.py"
+fi
+export ACTUAL_MODEL="${RUNNING_MODEL:-$CLAUDE_PROXY_MODEL}"
 
 # 2) 把 LLM 渠道临时指向 claude 代理（仅本次进程）
 export LLM_CHANNELS=claudecode
@@ -39,6 +54,9 @@ export LLM_CLAUDECODE_MODELS=claude-analysis
 export LLM_CLAUDECODE_ENABLED=true
 export LITELLM_MODEL=openai/claude-analysis
 export MAX_WORKERS="${MAX_WORKERS:-4}"
+# opus 单次 LLM 约 70-160s（opus-5 输出量近 opus-4-8 两倍），叠加数据源抖动会顶爆管道
+# 默认的 200s 单股预算，导致整只被判超时丢弃。这里放宽到 360s，仅影响本脚本这条链路。
+export SINGLE_STOCK_ANALYSIS_TIMEOUT="${SINGLE_STOCK_ANALYSIS_TIMEOUT:-360}"
 # 关闭数据源库(efinance/akshare)的 tqdm 进度条噪声，让日志只剩清晰的逐只进度
 export TQDM_DISABLE=1
 
@@ -60,7 +78,8 @@ send_email = os.environ.get("NO_EMAIL", "0") != "1"
 workers = int(os.environ.get("MAX_WORKERS", "4"))
 N = len(codes)
 
-print(f"[claude] ▶ 开始分析 {N} 只 (workers={workers}, 发邮件={send_email}, 模型=claude-opus-4-8)", flush=True)
+model_label = os.environ.get("ACTUAL_MODEL") or "(账号默认)"
+print(f"[claude] ▶ 开始分析 {N} 只 (workers={workers}, 发邮件={send_email}, 模型={model_label})", flush=True)
 print(f"[claude] 列表: {','.join(codes)}", flush=True)
 
 t0 = time.time()

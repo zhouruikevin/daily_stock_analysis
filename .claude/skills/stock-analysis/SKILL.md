@@ -8,7 +8,7 @@ description: >
 
 # Stock Analysis Skill（Claude 大脑 + 原管道）
 
-用 **Claude(claude-opus-4-8)** 作为分析大脑，**沿用项目原分析管道**（`analyze_stock`）产出报告——
+用 **Claude(claude-opus-4-8，可配置)** 作为分析大脑，**沿用项目原分析管道**（`analyze_stock`）产出报告——
 舆情/业绩预期/风险/利好、当日行情、数据透视、作战计划、财务摘要、关联板块全部由原管道原生生成，
 与百炼版报告结构完全一致。分析结果自动存库（分析历史/决策信号/指数），最后发一封合并邮件。
 
@@ -24,7 +24,7 @@ description: >
 
 ### 2. 后台启动分析并实时监控进度（关键：给用户反馈）
 
-**必须后台运行 + 用 Monitor 汇报进度**，不要前台干等（19 只约 12-15 分钟）。
+**必须后台运行 + 用 Monitor 汇报进度**，不要前台干等（21 只约 12 分钟，opus-4-8 + 并发 4 实测）。
 
 用 Bash `run_in_background: true` 启动，输出重定向到日志：
 
@@ -57,7 +57,8 @@ tail -f /tmp/stock_analysis_run.log | grep --line-buffered -E "▶|\[进度|■|
 2. **不要手动启代理**：脚本会自动检测并拉起 `claude_llm_proxy.py`。
 3. **必须后台跑 + Monitor 汇报进度**：让用户随时看到“跑到第几只”，不要闷头等。
 4. **默认发合并邮件**，不额外询问；用户明确说不发才加 `NO_EMAIL=1`。
-5. **只用 claude-opus-4-8**（账号唯一可用模型）。
+5. **模型默认 `claude-opus-4-8`**，由脚本的 `CLAUDE_PROXY_MODEL` 控制；需要换模型时用 `CLAUDE_PROXY_MODEL=xxx bash scripts/analyze_with_claude.sh`，并注意常驻代理需先停掉才会生效（脚本会告警提示）。
+   当前网关**仅放开 `claude-opus-4-8` 和 `claude-opus-5`**，`sonnet`/`haiku` 系列会直接失败（见故障排查）。
 
 ## 常用命令速查
 
@@ -97,6 +98,8 @@ MAX_WORKERS=5 bash scripts/analyze_with_claude.sh
 |------|------|
 | 代理启动失败 | 看 `/tmp/claude_proxy.log`；确认 `claude` CLI 已登录（`claude -p` 能返回） |
 | 某只 FAIL | 网关限流或数据缺失，脚本 fail-open 继续其余；可单独重跑该只 |
-| 模型报“需要授权/不存在” | 仅 `claude-opus-4-8` 可用；其它需网关开授权 |
+| 模型报“需要授权/不存在” | 网关当前只放开 `claude-opus-4-8` / `claude-opus-5`；`sonnet`、`haiku`、`claude-sonnet-4-5` 均报 400（需授权/模型不存在），需网关侧放开才能用 |
+| 全部股票 FAIL 且 `无法从响应中提取 JSON` | 大概率用了未授权模型：CLI 返回的是 `API Error: 400 ...` 文本而非 JSON，管道解析失败。用 `echo hi \| claude -p --bare --model <模型>` 单独验证模型可用性 |
+| 实际模型与预期不符 | 代理常驻进程模型在启动时固化；`pkill -f claude_llm_proxy.py` 后重跑脚本 |
 | 邮件未收到 | 检查 `.env` EMAIL_* 配置；`is_available()` 为假会跳过发送 |
-| 分析很慢 | opus 单只约 100-130s；提高 `MAX_WORKERS`（注意网关限流） |
+| 分析很慢 | 实测（并发 4）：opus-4-8 约 12 分钟 / 21 只，opus-5 约翻倍（单次 LLM 141s vs 75s，输出量多约 35%）。想更快提高 `MAX_WORKERS`（注意网关限流） |

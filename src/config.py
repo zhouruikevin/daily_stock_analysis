@@ -100,6 +100,8 @@ def _has_gotify_base_url(value: Optional[str]) -> bool:
 
 AGENT_MAX_STEPS_DEFAULT = 10
 FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT = 8.0
+# 单只股票分析的总预算（秒）。慢模型（单次 LLM 超过 150s）需上调，否则整只会被判超时丢弃。
+SINGLE_STOCK_ANALYSIS_TIMEOUT_DEFAULT = 200
 NEWS_STRATEGY_WINDOWS: Dict[str, int] = {
     "ultra_short": 1,
     "short": 3,
@@ -937,6 +939,8 @@ class Config:
     enable_fundamental_pipeline: bool = True
     # 基本面阶段总预算（秒）
     fundamental_stage_timeout_seconds: float = FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT
+    # 单只股票分析总预算（秒），超时该只判失败并继续下一只
+    single_stock_analysis_timeout: int = SINGLE_STOCK_ANALYSIS_TIMEOUT_DEFAULT
     # 单能力源调用超时（秒）
     fundamental_fetch_timeout_seconds: float = 3.0
     # 单能力失败重试次数（已包含首次）
@@ -1810,6 +1814,12 @@ class Config:
                 FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT,
                 field_name='FUNDAMENTAL_STAGE_TIMEOUT_SECONDS',
                 minimum=0.0,
+            ),
+            single_stock_analysis_timeout=parse_env_int(
+                os.getenv('SINGLE_STOCK_ANALYSIS_TIMEOUT'),
+                SINGLE_STOCK_ANALYSIS_TIMEOUT_DEFAULT,
+                field_name='SINGLE_STOCK_ANALYSIS_TIMEOUT',
+                minimum=1,
             ),
             fundamental_fetch_timeout_seconds=parse_env_float(
                 os.getenv('FUNDAMENTAL_FETCH_TIMEOUT_SECONDS'),
