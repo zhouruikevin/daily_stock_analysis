@@ -72,6 +72,30 @@ def _is_us_code(stock_code: str) -> bool:
     return bool(re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', code))
 
 
+def _resolve_tushare_http_url() -> Optional[str]:
+    """读取 Tushare 自定义接入地址并做基本校验。
+
+    优先读 ``TUSHARE_HTTP_URL``，回退读 ``TUSHARE_API_URL``（历史命名，向后兼容）。
+
+    - 留空 / 仅空白 / 未设置 → 返回 ``None``，调用方继续走官方默认地址。
+    - 设置则去掉首尾空白后返回，并校验必须是 ``http://`` 或 ``https://`` 前缀，
+      避免有人误填成纯主机名（如 ``api.tushare.pro``）导致 ``requests`` 把它
+      当成相对路径请求失败。
+    """
+    raw = os.getenv("TUSHARE_HTTP_URL") or os.getenv("TUSHARE_API_URL")
+    if not raw:
+        return None
+    url = raw.strip()
+    if not url:
+        return None
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError(
+            "TUSHARE_HTTP_URL 必须以 http:// 或 https:// 开头，"
+            f"当前值为 {url!r}"
+        )
+    return url
+
+
 class _TushareHttpClient:
     """Lightweight Tushare Pro client that does not require the tushare SDK."""
 
@@ -177,34 +201,21 @@ class TushareFetcher(BaseFetcher):
         """
         Build a Tushare Pro API client.
 
-        When TUSHARE_API_URL is configured (e.g. a self-hosted proxy),
-        use the official tushare SDK with pro._DataApi__http_url override,
-        because the proxy token only works through the official SDK.
+        The project already normalizes all Pro calls through the same request
+        contract, so we do not need the official tushare SDK during runtime.
 
-        When TUSHARE_API_URL is not set, fall back to the built-in
-        lightweight HTTP client to avoid requiring the tushare package.
+        支持通过 ``TUSHARE_HTTP_URL`` / ``TUSHARE_API_URL`` 环境变量将请求指向
+        自建或第三方兼容端点，便于在网络无法直达 ``api.tushare.pro`` 时切换镜像/网关。
+        留空或不设置则保持官方默认地址，行为与历史版本完全一致。
         """
-        config = get_config()
-        api_url = getattr(config, 'tushare_api_url', None)
-
+        api_url = _resolve_tushare_http_url()
         if api_url:
-            # 使用官方 tushare SDK + 自定义端点
-            try:
-                import tushare as ts
-                pro = ts.pro_api(token)
-                pro._DataApi__http_url = api_url
-                logger.info(f"Tushare API client: official SDK with custom endpoint ({api_url})")
-                return pro
-            except ImportError:
-                logger.warning("tushare SDK 未安装，回退到内置 HTTP client；代理端点可能不兼容")
-                client = _TushareHttpClient(token=token, api_url=api_url)
-                logger.debug(f"Tushare API client: built-in HTTP client (endpoint: {api_url})")
-                return client
+            logger.info("Tushare 使用自定义接入地址: %s", api_url)
+            client = _TushareHttpClient(token=token, api_url=api_url)
         else:
-            # 默认：使用内置轻量 HTTP client，无需 tushare SDK
             client = _TushareHttpClient(token=token)
-            logger.debug("Tushare API client: built-in HTTP client (endpoint: http://api.tushare.pro)")
-            return client
+        logger.debug("Tushare API client configured for direct HTTP calls")
+        return client
 
     def _determine_priority(self) -> int:
         """
