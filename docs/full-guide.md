@@ -454,7 +454,7 @@ daily_stock_analysis/
 >   - `fundamental_context.belong_boards` = 个股关联板块列表；A 股从 AkShare 板块名单写入，美股/港股从 yfinance `info.sector` / `info.industry` 写入，无数据时为 `[]`；
 >   - `fundamental_context.boards.data` = `sector_rankings`（板块涨跌榜，结构 `{top, bottom}`，HK/US 当前不提供）；
 >   - `fundamental_context.concept_boards.data` = `concept_rankings`（概念/题材涨跌榜，结构 `{top, bottom}`，当前仅 A 股提供；不可用时 fail-open 为空或缺失）；
->   - `fundamental_context.earnings.data.financial_report` = 财报摘要（报告期、营收、归母净利润、经营现金流、ROE，及 `currency` 来源 `info.financialCurrency`，HK ADR 常见为 CNY）；
+>   - `fundamental_context.earnings.data.financial_report` = 财报摘要（报告期、营收、归母净利润、经营现金流、ROE，及 `currency` 来源 `info.financialCurrency`，HK ADR 常见为 CNY）。**金额字段单位统一为元（币种基本单位）**，不做亿/万预缩放，由渲染层按 `currency` 加单位后缀；Tushare / AkShare / yfinance 三条数据源均需遵守该口径；
 >   - `fundamental_context.earnings.data.dividend` = 分红指标（仅现金分红税前口径，含 `events`、`ttm_cash_dividend_per_share`、`ttm_dividend_yield_pct`、`currency`）。`currency` 独立读取自 `info.currency`，与 `financial_report.currency` 可能不同（HK ADR 财报 CNY、分红 HKD）；TTM yield 默认按 `ttm_cash / latest_price * 100`（同币种）即时重算，仅在 TTM cash 或 latest price 缺失时回退到 yfinance `trailingAnnualDividendYield` 或 `dividendYield`；
 >   - `get_stock_info.belong_boards` = 个股所属板块列表；
 >   - `get_stock_info.boards` 为兼容别名，值与 `belong_boards` 相同（未来仅在大版本考虑移除）；

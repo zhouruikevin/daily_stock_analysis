@@ -278,14 +278,6 @@ def _to_tushare_ts_code(stock_code: str) -> str:
     return code
 
 
-def _format_wan_to_yi(value: Any) -> Optional[float]:
-    """Convert Tushare's 万元 unit to 亿元 for readability."""
-    v = _safe_float(value)
-    if v is None:
-        return None
-    return round(v / 10000.0, 4)
-
-
 class TushareFundamentalAdapter:
     """Tushare Pro adapter for earnings forecast, financial indicators and dividends.
 
@@ -501,8 +493,10 @@ class TushareFundamentalAdapter:
             pass
 
         row = df.iloc[0]
-        result["revenue"] = _format_wan_to_yi(row.get("revenue")) or _format_wan_to_yi(row.get("total_revenue"))
-        result["n_income_parent"] = _format_wan_to_yi(row.get("n_income_attr_p"))
+        # Tushare income amounts are already in 元 — the unit every consumer
+        # (notification._format_amount_cn, AkShare/yfinance paths) expects.
+        result["revenue"] = _safe_float(row.get("revenue")) or _safe_float(row.get("total_revenue"))
+        result["n_income_parent"] = _safe_float(row.get("n_income_attr_p"))
         result["revenue_yoy"] = _safe_float(row.get("revenue_yoy"))
         result["n_income_yoy"] = _safe_float(row.get("n_income_yoy"))
         result["report_date"] = _safe_str(row.get("end_date"))
@@ -516,7 +510,8 @@ class TushareFundamentalAdapter:
             "quick_report_summary": None,
             "revenue": None,
             "n_income": None,
-            "yoy_net_profit": None,
+            "np_last_year": None,
+            "n_income_yoy": None,
             "report_date": None,
             "ann_date": None,
             "source": None,
@@ -542,26 +537,34 @@ class TushareFundamentalAdapter:
             pass
 
         row = df.iloc[0]
-        revenue = _format_wan_to_yi(row.get("revenue"))
-        n_income = _format_wan_to_yi(row.get("n_income"))
-        yoy_net = _safe_float(row.get("yoy_net_profit"))
+        # express amounts are in 元; `yoy_net_profit` is 去年同期修正后净利润 (元),
+        # not a growth rate — deriving the rate here keeps that distinction explicit.
+        revenue = _safe_float(row.get("revenue"))
+        n_income = _safe_float(row.get("n_income"))
+        np_last_year = _safe_float(row.get("yoy_net_profit"))
         end_date = _safe_str(row.get("end_date"))
+
+        n_income_yoy = None
+        if n_income is not None and np_last_year is not None and np_last_year > 0:
+            n_income_yoy = (n_income - np_last_year) / np_last_year * 100.0
 
         # Build human-readable summary
         parts = []
         if revenue is not None:
-            parts.append(f"营收{revenue:.2f}亿")
+            parts.append(f"营收{revenue / 1e8:.2f}亿")
         if n_income is not None:
-            parts.append(f"净利润{n_income:.2f}亿")
-        if yoy_net is not None:
-            parts.append(f"同比{'增长' if yoy_net > 0 else '下降'}{abs(yoy_net):.1f}%")
+            parts.append(f"净利润{n_income / 1e8:.2f}亿")
+        # A non-positive base makes the rate meaningless; omit rather than fabricate one.
+        if n_income_yoy is not None:
+            parts.append(f"同比{'增长' if n_income_yoy > 0 else '下降'}{abs(n_income_yoy):.1f}%")
         if end_date:
             parts.append(f"报告期{end_date}")
 
         result["quick_report_summary"] = ", ".join(parts) if parts else None
         result["revenue"] = revenue
         result["n_income"] = n_income
-        result["yoy_net_profit"] = yoy_net
+        result["np_last_year"] = np_last_year
+        result["n_income_yoy"] = n_income_yoy
         result["report_date"] = end_date
         result["ann_date"] = _safe_str(row.get("ann_date"))
         result["source"] = "tushare_express"

@@ -260,7 +260,10 @@ class ReportDetails(BaseModel):
         None,
         description="本次分析输入上下文包低敏摘要",
     )
-    financial_report: Optional[Any] = Field(None, description="结构化财报摘要（来自 fundamental_context）")
+    financial_report: Optional[Any] = Field(
+        None,
+        description="结构化财报摘要（来自 fundamental_context）。金额字段单位为元，币种以 currency 字段为准，缺省 CNY",
+    )
     dividend_metrics: Optional[Any] = Field(None, description="结构化分红指标（含 TTM 口径）")
     belong_boards: Optional[Any] = Field(None, description="关联板块列表")
     sector_rankings: Optional[Any] = Field(None, description="板块涨跌榜（结构 {top, bottom}）")

@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from data_provider.fundamental_adapter import (
     AkshareFundamentalAdapter,
+    TushareFundamentalAdapter,
     _build_dividend_payload,
     _extract_latest_row,
     _parse_dividend_plan_to_per_share,
@@ -169,6 +170,109 @@ class TestFundamentalAdapter(unittest.TestCase):
         payload = _build_dividend_payload(df, stock_code="600519")
         self.assertEqual(payload.get("ttm_event_count"), 1)
         self.assertAlmostEqual(payload.get("ttm_cash_dividend_per_share"), 0.3, places=6)
+
+
+class TestTushareFundamentalUnits(unittest.TestCase):
+    """Tushare income/express amounts are 元; they must reach consumers unscaled.
+
+    Real 002373 figures are used so a regression shows up as a recognisably wrong
+    report line rather than an abstract number mismatch.
+    """
+
+    # 002373.SZ 2026Q1 income statement, verbatim from the Tushare income API
+    _INCOME_REVENUE = 1312997128.0   # 13.13 亿元
+    _INCOME_NET_PROFIT = 3735873.0   # 373.59 万元
+
+    # 002373.SZ 2020 annual express, verbatim from the Tushare express API
+    _EXPRESS_REVENUE = 9477651800.0      # 94.78 亿元
+    _EXPRESS_NET_INCOME = 1070597700.0   # 10.71 亿元
+    _EXPRESS_NP_LAST_YEAR = 1013374200.0  # 去年同期净利润, 元 (NOT a percentage)
+
+    def _income_df(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "ts_code": ["002373.SZ"],
+                "ann_date": ["20260428"],
+                "end_date": ["20260331"],
+                "total_revenue": [self._INCOME_REVENUE],
+                "revenue": [self._INCOME_REVENUE],
+                "n_income_attr_p": [self._INCOME_NET_PROFIT],
+            }
+        )
+
+    _UNSET = object()  # distinct from None, which is itself a case under test
+
+    def _express_df(self, np_last_year: object = _UNSET) -> pd.DataFrame:
+        if np_last_year is self._UNSET:
+            np_last_year = self._EXPRESS_NP_LAST_YEAR
+        return pd.DataFrame(
+            {
+                "ts_code": ["002373.SZ"],
+                "ann_date": ["20210227"],
+                "end_date": ["20201231"],
+                "revenue": [self._EXPRESS_REVENUE],
+                "n_income": [self._EXPRESS_NET_INCOME],
+                "yoy_net_profit": [np_last_year],
+            }
+        )
+
+    def test_income_statement_keeps_yuan_unit(self) -> None:
+        adapter = TushareFundamentalAdapter()
+        with patch.object(adapter, "_call_api", return_value=self._income_df()):
+            result = adapter.get_income_statement("002373")
+
+        self.assertAlmostEqual(result["revenue"], self._INCOME_REVENUE, places=2)
+        self.assertAlmostEqual(result["n_income_parent"], self._INCOME_NET_PROFIT, places=2)
+
+    def test_financial_report_amounts_render_with_correct_unit(self) -> None:
+        """Locks the provider contract to the notification renderer's 元 assumption."""
+        from src.notification import NotificationService
+
+        adapter = TushareFundamentalAdapter()
+        with patch.object(adapter, "_call_api", return_value=self._income_df()):
+            result = adapter.get_income_statement("002373")
+
+        self.assertEqual(NotificationService._format_amount_cn(result["revenue"]), "13.13 亿元")
+        self.assertEqual(
+            NotificationService._format_amount_cn(result["n_income_parent"]), "373.59 万元"
+        )
+
+    def test_express_summary_labels_yi_from_yuan(self) -> None:
+        adapter = TushareFundamentalAdapter()
+        with patch.object(adapter, "_call_api", return_value=self._express_df()):
+            result = adapter.get_express("002373")
+
+        summary = result["quick_report_summary"]
+        self.assertIn("营收94.78亿", summary)
+        self.assertIn("净利润10.71亿", summary)
+        # the 1e4-off values that shipped before the fix must not reappear
+        self.assertNotIn("947765", summary)
+        self.assertNotIn("107059", summary)
+
+    def test_express_yoy_derived_from_last_year_amount(self) -> None:
+        """express.yoy_net_profit is 去年同期净利润(元), not a growth rate."""
+        adapter = TushareFundamentalAdapter()
+        with patch.object(adapter, "_call_api", return_value=self._express_df()):
+            result = adapter.get_express("002373")
+
+        # (1070597700 - 1013374200) / 1013374200 = +5.65%
+        self.assertAlmostEqual(result["n_income_yoy"], 5.6467, places=3)
+        self.assertAlmostEqual(result["np_last_year"], self._EXPRESS_NP_LAST_YEAR, places=2)
+        self.assertIn("同比增长5.6%", result["quick_report_summary"])
+        self.assertNotIn("1013374200", result["quick_report_summary"])
+
+    def test_express_omits_yoy_when_last_year_non_positive(self) -> None:
+        """A zero/negative base makes the growth rate meaningless — omit it, don't fabricate."""
+        for base in (0.0, -1234.0, None):
+            with self.subTest(np_last_year=base):
+                adapter = TushareFundamentalAdapter()
+                with patch.object(adapter, "_call_api", return_value=self._express_df(base)):
+                    result = adapter.get_express("002373")
+
+                self.assertIsNone(result["n_income_yoy"])
+                self.assertNotIn("同比", result["quick_report_summary"])
+                # the rest of the summary still renders
+                self.assertIn("营收94.78亿", result["quick_report_summary"])
 
 
 if __name__ == "__main__":

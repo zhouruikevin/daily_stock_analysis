@@ -3835,9 +3835,9 @@ class GeminiAnalyzer:
 | 指标 | 数值 | 说明 |
 |------|------|------|
 | 最近报告期 | {report_date} | 来自结构化财报字段 |
-| 营业收入 | {financial_report.get('revenue', 'N/A')} | |
-| 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | |
-| 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |
+| 营业收入 | {financial_report.get('revenue', 'N/A')} | 单位：元 |
+| 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | 单位：元 |
+| 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | 单位：元 |
 | ROE | {financial_report.get('roe', 'N/A')} | |
 | 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |
 | TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
