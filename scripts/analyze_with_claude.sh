@@ -1,9 +1,9 @@
 #!/bin/bash
 # 用 Claude 经原分析管道分析股票，逐只反馈进度，最后发合并邮件。
-# 模型：CLAUDE_PROXY_MODEL（默认 claude-opus-4-8），可用 CLAUDE_PROXY_MODEL=xxx 覆盖。
-# 默认选 opus-4-8 而非 opus-5：同 prompt 下单次 LLM 75s vs 141s，21 只整轮 12min vs 22min+，
-# 报告字段完整性一致（无占位补全）；opus-5 输出更详细但评分尺子更严，需要时显式覆盖。
-# 注意：网关当前仅放开 claude-opus-4-8 / claude-opus-5，sonnet/haiku 会 400 失败。
+# 模型：CLAUDE_PROXY_MODEL（默认 claude-opus-5），可用 CLAUDE_PROXY_MODEL=xxx 覆盖。
+# 默认不再用 opus-4-8：2026-08-11 复核，网关已回收其授权（400 该模型需要授权,model:claude-opus-4-8），
+# 整轮分析会全部 FAIL；同日 claude-sonnet-5 亦 400，实测仅 claude-opus-5 可用。
+# opus-5 比旧 opus-4-8 慢约一倍（单次 LLM 141s vs 75s），21 只整轮约 22min，属预期。
 #
 # 用法（在项目根目录执行）：
 #   bash scripts/analyze_with_claude.sh                 # 分析 .env 的 STOCK_LIST（关注列表）
@@ -20,7 +20,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PY=.venv/bin/python3
 PROXY_URL="http://127.0.0.1:8766"
-export CLAUDE_PROXY_MODEL="${CLAUDE_PROXY_MODEL:-claude-opus-4-8}"
+export CLAUDE_PROXY_MODEL="${CLAUDE_PROXY_MODEL:-claude-opus-5}"
 
 # 1) 确保代理在运行（未启动则自动拉起）
 if ! curl -s "${PROXY_URL}/health" >/dev/null 2>&1; then

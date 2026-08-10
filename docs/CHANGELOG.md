@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] `scripts/analyze_with_claude.sh` 默认模型从 `claude-opus-4-8` 改为 `claude-opus-5`：网关已回收 opus-4-8 授权，`echo hi | claude -p --bare --model claude-opus-4-8` 返回 `API Error: 400 该模型需要授权,model:claude-opus-4-8`，CLI 把该错误文本当正文返回，管道解析不出 JSON，整轮分析每只都 FAIL（本段下方两条 opus-4-8 ↔ opus-5 默认值变更均已被此条取代）。同日复核 `claude-sonnet-5` 同样 400，实测仅 `claude-opus-5` 可用。`.claude/skills/stock-analysis/SKILL.md` 同步更新默认模型、网关可用模型清单与耗时基准（21 只约 22min，此前按 opus-4-8 写的 12min 已不可达），并要求换模型前先用单条 CLI 验证可用性；`scripts/claude_llm_proxy.py` 的 `CLAUDE_PROXY_MODEL` 说明不再举例 `sonnet`/`haiku`（这两类在本网关必然 400）。模型仍可用 `CLAUDE_PROXY_MODEL` 覆盖，代理进程模型在启动时固化的告警逻辑不变。
 - [修复] Tushare 财报金额单位错误：`income`/`express` 返回的是元，却被 `_format_wan_to_yi` 当成万元除以 1e4，导致报告「财务摘要」把 13.13 亿元营收渲染成 `13.13 万元`、373.59 万元净利润渲染成 `374 元`。删除该函数，Tushare 路径改为原样传元，与 AkShare / yfinance 两条路径及 `notification._format_amount_cn` 的元口径统一；同时消除 `data_provider/base.py` 字段级 merge 里 `revenue`（万元）与 `operating_cash_flow`（元）在同一行差 1e4 的混合单位。
 - [修复] 业绩快报口径错误：`quick_report_summary` 此前把万元值贴「亿」标签（输出 `营收947765.18亿`，实际 94.78 亿），且把 Tushare `express.yoy_net_profit`（含义为去年同期修正后净利润，单位元）当成同比率输出 `同比增长1013374200.0%`。现按元换算亿标签，并由本期与去年同期两个元值计算同比；去年同期为 0 或负数时同比无意义，省略该子句而不是输出可疑数字。结果字段相应改为 `np_last_year`（去年同期净利润，元）与 `n_income_yoy`（同比 %）。
 - [修复] 补充 Tushare 财报路径的回归测试（此前 `get_income_statement` / `get_express` 零覆盖，是本次单位 bug 能出厂的原因），并在 LLM prompt 财报表格与 `financial_report` API schema 描述中显式标注金额单位为元。

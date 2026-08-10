@@ -24,7 +24,8 @@ Claude LLM Proxy - OpenAI 兼容代理服务
   CLAUDE_PROXY_PORT     监听端口（默认 8766）
   CLAUDE_PATH           claude 可执行文件路径（默认 /opt/homebrew/bin/claude，回退 claude）
   CLAUDE_PROXY_TIMEOUT  单次请求超时秒数（默认 300）
-  CLAUDE_PROXY_MODEL    传给 claude 的模型（默认空=用账号默认模型；可设 sonnet/opus/haiku）
+  CLAUDE_PROXY_MODEL    传给 claude 的模型（默认空=用账号默认模型）。可用模型取决于网关授权，
+                        当前实测仅 claude-opus-5；未授权模型会让 CLI 返回 400 错误文本而非正文
   CLAUDE_PROXY_CWD      claude 子进程工作目录（默认 /tmp，避免读到项目 CLAUDE.md）
 
 对比 qoder_llm_proxy.py 的差异：
