@@ -29,6 +29,35 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertAlmostEqual(_parse_dividend_plan_to_per_share("每股派0.8元"), 0.8, places=6)
         self.assertIsNone(_parse_dividend_plan_to_per_share("仅送股，不现金分红"))
 
+    def test_extract_latest_row_uses_date_col_regardless_of_input_order(self) -> None:
+        """传 date_col 时按日期取最新，不依赖上游返回顺序（东财 daykline 是升序）。"""
+        df = pd.DataFrame(
+            {
+                "日期": ["2026-08-03", "2026-08-10", "2026-08-06"],
+                "主力净流入-净额": [100.0, 300.0, 200.0],
+            }
+        )
+        row = _extract_latest_row(df, "600519", date_col="日期")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["主力净流入-净额"], 300.0)
+
+    def test_extract_latest_row_default_behavior_unchanged(self) -> None:
+        """不传 date_col 时仍取首行——保护其它复用该函数的区块。"""
+        df = pd.DataFrame(
+            {
+                "日期": ["2026-08-03", "2026-08-10"],
+                "值": [1, 2],
+            }
+        )
+        row = _extract_latest_row(df, "600519")
+        self.assertEqual(row["值"], 1)
+
+    def test_extract_latest_row_ignores_unparsable_date_col(self) -> None:
+        """日期列不可解析时回落首行，不能因为排序失败就丢数据。"""
+        df = pd.DataFrame({"日期": ["n/a", "--"], "值": [7, 8]})
+        row = _extract_latest_row(df, "600519", date_col="日期")
+        self.assertEqual(row["值"], 7)
+
     def test_extract_latest_row_returns_none_when_code_mismatch(self) -> None:
         df = pd.DataFrame(
             {
@@ -273,6 +302,162 @@ class TestTushareFundamentalUnits(unittest.TestCase):
                 self.assertNotIn("同比", result["quick_report_summary"])
                 # the rest of the summary still renders
                 self.assertIn("营收94.78亿", result["quick_report_summary"])
+
+
+class TestTushareCapitalFlow(unittest.TestCase):
+    """Tushare 资金流：单位换算、主力口径、滚动求和、板块源优先级。
+
+    单位是这条链路唯一容易静默出错的地方（moneyflow 万元 / ind_ths 亿元 / ind_dc 元），
+    所以每个换算系数都在这里钉住。
+    """
+
+    # 各行主力净额（万元）：最新一天 100，逐日递增，便于直接验算滚动和
+    _DAILY_MAIN_NET_WAN = [
+        ("20260810", 100.0),
+        ("20260809", 200.0),
+        ("20260808", 300.0),
+        ("20260807", 400.0),
+        ("20260806", 500.0),
+        ("20260805", 600.0),
+        ("20260804", 700.0),
+        ("20260803", 800.0),
+        ("20260802", 900.0),
+        ("20260801", 1000.0),
+        # 第 11、12 天不应进入 5日/10日 求和
+        ("20260731", 99999.0),
+        ("20260730", 99999.0),
+    ]
+    _NET_MF_AMOUNT_DECOY = 777777.0
+
+    def _moneyflow_df(self) -> pd.DataFrame:
+        rows = []
+        for trade_date, main_net_wan in self._DAILY_MAIN_NET_WAN:
+            rows.append(
+                {
+                    "trade_date": trade_date,
+                    # 主力 = 超大单 + 大单
+                    "buy_elg_amount": main_net_wan,
+                    "buy_lg_amount": 0.0,
+                    "sell_elg_amount": 0.0,
+                    "sell_lg_amount": 0.0,
+                    # 中小单必须被排除在主力口径之外，给个大值放哨
+                    "buy_md_amount": 50000.0,
+                    "sell_md_amount": 0.0,
+                    "buy_sm_amount": 60000.0,
+                    "sell_sm_amount": 0.0,
+                    # Tushare 现成的 net_mf_amount 口径不同，不应被使用
+                    "net_mf_amount": self._NET_MF_AMOUNT_DECOY,
+                }
+            )
+        # 乱序输入，验证内部按 trade_date 降序排序
+        shuffled = rows[5:] + rows[:5]
+        return pd.DataFrame(shuffled)
+
+    @staticmethod
+    def _dc_df() -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "content_type": ["行业", "行业", "地域", "概念", "行业"],
+                "name": ["半导体设备", "银行", "上海板块", "AI", "食品饮料"],
+                # DC 的 net_amount 已是元，应原样透传
+                "net_amount": [3.0e9, -2.0e9, 9.9e9, 8.8e9, 1.0e9],
+            }
+        )
+
+    @staticmethod
+    def _ths_df() -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "industry": ["银行", "白酒", "钢铁"],
+                # THS 的 net_amount 是亿元，需 ×1e8
+                "net_amount": [21.0, 19.0, -5.0],
+            }
+        )
+
+    def _adapter(self, *, moneyflow=None, dc=None, ths=None) -> TushareFundamentalAdapter:
+        adapter = TushareFundamentalAdapter()
+        # 不依赖本机是否配置了 TUSHARE_TOKEN，显式置为可用
+        adapter._api = object()
+        table = {
+            "moneyflow": moneyflow,
+            "moneyflow_ind_dc": dc,
+            "moneyflow_ind_ths": ths,
+        }
+        patcher = patch.object(
+            adapter, "_call_api", side_effect=lambda api_name, **kwargs: table.get(api_name)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return adapter
+
+    def test_main_net_inflow_uses_main_force_caliber_in_yuan(self) -> None:
+        adapter = self._adapter(moneyflow=self._moneyflow_df(), dc=self._dc_df())
+        flow = adapter.get_capital_flow("600519")["stock_flow"]
+
+        # 最新交易日 20260810 主力净额 100 万元 -> 1e6 元
+        self.assertAlmostEqual(flow["main_net_inflow"], 100.0 * 1e4, places=2)
+        # 绝不能用 net_mf_amount（口径含中小单，与 AkShare 路径不可比）
+        self.assertNotAlmostEqual(
+            flow["main_net_inflow"], self._NET_MF_AMOUNT_DECOY * 1e4, places=2
+        )
+
+    def test_rolling_sums_respect_date_order_and_window(self) -> None:
+        adapter = self._adapter(moneyflow=self._moneyflow_df(), dc=self._dc_df())
+        flow = adapter.get_capital_flow("600519")["stock_flow"]
+
+        self.assertAlmostEqual(flow["inflow_5d"], 1500.0 * 1e4, places=2)
+        self.assertAlmostEqual(flow["inflow_10d"], 5500.0 * 1e4, places=2)
+        # 第 11/12 天的 99999 未被计入，说明窗口和排序都对
+        self.assertLess(flow["inflow_10d"], 99999.0 * 1e4)
+
+    def test_sector_dc_passes_yuan_through_and_filters_non_industry(self) -> None:
+        adapter = self._adapter(moneyflow=self._moneyflow_df(), dc=self._dc_df())
+        result = adapter.get_capital_flow("600519")
+        rankings = result["sector_rankings"]
+
+        self.assertEqual(rankings["top"][0]["name"], "半导体设备")
+        self.assertAlmostEqual(rankings["top"][0]["net_inflow"], 3.0e9, places=2)
+        self.assertEqual(rankings["bottom"][0]["name"], "银行")
+        # 地域 / 概念 行必须被过滤掉，否则会污染行业榜
+        names = [item["name"] for item in rankings["top"] + rankings["bottom"]]
+        self.assertNotIn("上海板块", names)
+        self.assertNotIn("AI", names)
+        self.assertIn("capital_sector:tushare_moneyflow_ind_dc", result["source_chain"])
+
+    def test_sector_falls_back_to_ths_and_converts_yi_to_yuan(self) -> None:
+        adapter = self._adapter(moneyflow=self._moneyflow_df(), dc=None, ths=self._ths_df())
+        result = adapter.get_capital_flow("600519")
+        rankings = result["sector_rankings"]
+
+        self.assertEqual(rankings["top"][0]["name"], "银行")
+        # 21 亿元 -> 2.1e9 元
+        self.assertAlmostEqual(rankings["top"][0]["net_inflow"], 21.0 * 1e8, places=2)
+        self.assertIn("capital_sector:tushare_moneyflow_ind_ths", result["source_chain"])
+        self.assertIn("moneyflow_ind_dc_api_failed", result["errors"])
+
+    def test_stock_flow_survives_sector_failure(self) -> None:
+        """板块两源都挂时，个股数据仍要保留（fail-open，不能整块丢弃）。"""
+        adapter = self._adapter(moneyflow=self._moneyflow_df(), dc=None, ths=None)
+        result = adapter.get_capital_flow("600519")
+
+        self.assertEqual(result["status"], "partial")
+        self.assertIsNotNone(result["stock_flow"]["main_net_inflow"])
+        self.assertEqual(result["sector_rankings"]["top"], [])
+
+    def test_not_available_without_token(self) -> None:
+        adapter = TushareFundamentalAdapter()
+        adapter._api = None
+        result = adapter.get_capital_flow("600519")
+
+        self.assertEqual(result["status"], "not_supported")
+        self.assertIn("tushare_not_available", result["errors"])
+
+    def test_moneyflow_api_failure_reports_error(self) -> None:
+        adapter = self._adapter(moneyflow=None, dc=None, ths=None)
+        result = adapter.get_capital_flow("600519")
+
+        self.assertEqual(result["status"], "not_supported")
+        self.assertIn("moneyflow_api_failed", result["errors"])
 
 
 if __name__ == "__main__":

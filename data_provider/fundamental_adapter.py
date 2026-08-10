@@ -240,9 +240,16 @@ def _build_dividend_payload(
     }
 
 
-def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series]:
+def _extract_latest_row(
+    df: pd.DataFrame,
+    stock_code: str,
+    date_col: Optional[str] = None,
+) -> Optional[pd.Series]:
     """
     Select the most relevant row for the given stock.
+
+    date_col: 显式指定日期列时按它降序取最新一行。不传则保持历史行为
+    （无代码列时取 df.iloc[0]），以免影响其它复用该函数的区块。
     """
     if df is None or df.empty:
         return None
@@ -260,7 +267,20 @@ def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series
                 continue
         return None
 
-    # Fallback: use latest row
+    # 有日期列就按日期取最新，不靠上游返回顺序：东财 daykline 是按日期升序返回的，
+    # 直接 iloc[0] 会取到区间内最早那天（资金流因此可能是陈年数据）。
+    if date_col and date_col in df.columns:
+        try:
+            ordered = df.assign(
+                **{"__sort_date": pd.to_datetime(df[date_col], errors="coerce")}
+            ).sort_values("__sort_date", ascending=False)
+            ordered = ordered[ordered["__sort_date"].notna()]
+            if not ordered.empty:
+                return ordered.drop(columns=["__sort_date"]).iloc[0]
+        except Exception:
+            pass
+
+    # Fallback: use first row
     return df.iloc[0]
 
 
@@ -276,6 +296,12 @@ def _to_tushare_ts_code(stock_code: str) -> str:
     if code.startswith(('4', '8')):
         return f"{code}.BJ"
     return code
+
+
+# Tushare 三个资金流接口的金额单位互不相同，对外统一输出「元」
+# （项目金额口径：元，不预缩放，渲染层加单位，见 docs/full-guide.md）。
+_MONEYFLOW_WAN_TO_YUAN = 1e4  # moneyflow.*_amount 为万元
+_MONEYFLOW_YI_TO_YUAN = 1e8  # moneyflow_ind_ths.net_amount 为亿元（moneyflow_ind_dc 已是元）
 
 
 class TushareFundamentalAdapter:
@@ -645,6 +671,166 @@ class TushareFundamentalAdapter:
 
         return result
 
+    def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
+        """Return stock + sector capital flow from Tushare.
+
+        返回结构与 AkshareFundamentalAdapter.get_capital_flow 同构，便于上层整块择一。
+
+        单位：对外统一输出「元」。三个上游接口口径互不相同（moneyflow 万元、
+        moneyflow_ind_ths 亿元、moneyflow_ind_dc 元），因此在各自取数处显式换算，
+        不做统一后处理——混单位是此前财报路径出过的事故类型。
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "stock_flow": {},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        if not self.is_available:
+            result["errors"].append("tushare_not_available")
+            return result
+
+        ts_code = _to_tushare_ts_code(stock_code)
+        if "." not in ts_code:
+            result["errors"].append("invalid_stock_code")
+            return result
+
+        latest_trade_date = self._fill_stock_flow(result, ts_code)
+        # 板块接口只接受单一 trade_date，直接复用个股返回的最新交易日：
+        # 省掉一次交易日历调用，也避免非交易日/盘中空档查到空数据。
+        if latest_trade_date:
+            self._fill_sector_rankings(result, latest_trade_date, top_n)
+
+        has_content = bool(
+            result["stock_flow"]
+            or result["sector_rankings"]["top"]
+            or result["sector_rankings"]["bottom"]
+        )
+        result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def _fill_stock_flow(self, result: Dict[str, Any], ts_code: str) -> Optional[str]:
+        """填充个股资金流；返回数据中的最新交易日，供板块查询复用。"""
+        end_date = datetime.now()
+        # 回看 30 个自然日以覆盖 10 个交易日（含长假）。moneyflow 支持区间查询，
+        # 所以无需先解析交易日历。
+        start_date = end_date - timedelta(days=30)
+        df = self._call_api(
+            "moneyflow",
+            ts_code=ts_code,
+            start_date=start_date.strftime("%Y%m%d"),
+            end_date=end_date.strftime("%Y%m%d"),
+        )
+        if df is None:
+            result["errors"].append("moneyflow_api_failed")
+            return None
+
+        required = (
+            "trade_date",
+            "buy_elg_amount",
+            "buy_lg_amount",
+            "sell_elg_amount",
+            "sell_lg_amount",
+        )
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            result["errors"].append(f"moneyflow_missing_columns:{','.join(missing)}")
+            return None
+
+        df = df.sort_values("trade_date", ascending=False)
+
+        def _numeric(col: str) -> pd.Series:
+            return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+        # 主力口径对齐东财「主力净流入」= 超大单 + 大单 净额。
+        # 不用现成的 net_mf_amount：它的口径含中小单，与 AkShare 兜底路径不可比，
+        # 换源会让只取符号的护栏（analyzer._capital_flow_bias_with_status）结论漂移。
+        main_net = (
+            (_numeric("buy_elg_amount") + _numeric("buy_lg_amount"))
+            - (_numeric("sell_elg_amount") + _numeric("sell_lg_amount"))
+        ) * _MONEYFLOW_WAN_TO_YUAN
+        if main_net.empty:
+            result["errors"].append("moneyflow_empty")
+            return None
+
+        result["stock_flow"] = {
+            "main_net_inflow": float(main_net.iloc[0]),
+            # AkShare 路径这两项结构性缺失（其接口没有 5日/10日 列），
+            # Tushare 返回逐日历史，可以真正求和。
+            "inflow_5d": float(main_net.head(5).sum()),
+            "inflow_10d": float(main_net.head(10).sum()),
+        }
+        result["source_chain"].append("capital_stock:tushare_moneyflow")
+        return _safe_str(df["trade_date"].iloc[0]) or None
+
+    def _fill_sector_rankings(
+        self,
+        result: Dict[str, Any],
+        trade_date: str,
+        top_n: int,
+    ) -> None:
+        """填充板块资金流：DC（东财）优先，THS（同花顺）兜底。"""
+        # DC 与 AkShare 原路径同为东财口径，行业分类和单位（元）都直接对齐现有契约，
+        # 故优先；THS 作兜底，其 net_amount 是亿元，与 DC 差 1e8，必须换算。
+        candidates: Tuple[Tuple[str, str, str, float, Optional[str]], ...] = (
+            ("moneyflow_ind_dc", "name", "net_amount", 1.0, "行业"),
+            ("moneyflow_ind_ths", "industry", "net_amount", _MONEYFLOW_YI_TO_YUAN, None),
+        )
+        for api_name, name_col, flow_col, multiplier, content_type in candidates:
+            df = self._call_api(api_name, trade_date=trade_date)
+            if df is None:
+                result["errors"].append(f"{api_name}_api_failed")
+                continue
+            if content_type is not None:
+                if "content_type" not in df.columns:
+                    result["errors"].append(f"{api_name}_missing_content_type")
+                    continue
+                # DC 同时返回 地域/概念/行业 三类，只取行业以对齐 AkShare 的行业资金流榜
+                df = df[df["content_type"] == content_type]
+            if not {name_col, flow_col}.issubset(df.columns):
+                result["errors"].append(f"{api_name}_missing_columns")
+                continue
+            if self._apply_sector_frame(
+                result, df, name_col, flow_col, multiplier, top_n, f"tushare_{api_name}"
+            ):
+                return
+            result["errors"].append(f"{api_name}_empty")
+
+    @staticmethod
+    def _apply_sector_frame(
+        result: Dict[str, Any],
+        df: pd.DataFrame,
+        name_col: str,
+        flow_col: str,
+        multiplier: float,
+        top_n: int,
+        source: str,
+    ) -> bool:
+        """把板块资金流 DataFrame 归一成 top/bottom 榜（单位换算到元）；无有效行返回 False。"""
+        work_df = df[[name_col, flow_col]].copy()
+        work_df[flow_col] = pd.to_numeric(work_df[flow_col], errors="coerce")
+        work_df = work_df.dropna(subset=[flow_col])
+        if work_df.empty:
+            return False
+
+        def _rows(frame: pd.DataFrame) -> List[Dict[str, Any]]:
+            return [
+                {
+                    "name": _safe_str(row[name_col]),
+                    "net_inflow": float(row[flow_col]) * multiplier,
+                }
+                for _, row in frame.iterrows()
+            ]
+
+        result["sector_rankings"] = {
+            "top": _rows(work_df.nlargest(top_n, flow_col)),
+            "bottom": _rows(work_df.nsmallest(top_n, flow_col)),
+        }
+        result["source_chain"].append(f"capital_sector:{source}")
+        return True
+
 
 class AkshareFundamentalAdapter:
     """AkShare adapter for fundamentals, capital flow and dragon-tiger signals."""
@@ -819,9 +1005,13 @@ class AkshareFundamentalAdapter:
         ])
         result["errors"].extend(stock_errors)
         if stock_df is not None:
-            row = _extract_latest_row(stock_df, stock_code)
+            # 这批接口只有「日期」列、没有代码列，必须显式按日期取最新：
+            # 东财 daykline 按日期升序返回全量历史，取 iloc[0] 会拿到最早那天。
+            row = _extract_latest_row(stock_df, stock_code, date_col="日期")
             if row is not None:
                 net_inflow = _safe_float(_pick_by_keywords(row, ["主力净流入", "净流入", "净额"]))
+                # stock_individual_fund_flow 的列里没有 5日/10日，这两项在该源上恒为 None
+                # （只有 stock_main_fund_flow / 板块榜才有）；真实滚动值由 Tushare 路径提供。
                 inflow_5d = _safe_float(_pick_by_keywords(row, ["5日", "五日"]))
                 inflow_10d = _safe_float(_pick_by_keywords(row, ["10日", "十日"]))
                 result["stock_flow"] = {

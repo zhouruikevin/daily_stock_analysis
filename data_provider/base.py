@@ -3688,6 +3688,19 @@ class DataFetcherManager:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
         return result_ctx
 
+    @staticmethod
+    def _capital_flow_has_content(payload: Dict[str, Any]) -> bool:
+        """判断资金流 payload 是否含实际数据（个股任一字段有值，或板块榜非空）。"""
+        stock_flow = payload.get("stock_flow") or {}
+        sector_rankings = payload.get("sector_rankings") or {}
+        has_stock_flow = isinstance(stock_flow, dict) and any(
+            value is not None for value in stock_flow.values()
+        )
+        has_sector_rankings = bool(sector_rankings.get("top")) or bool(
+            sector_rankings.get("bottom")
+        )
+        return has_stock_flow or has_sector_rankings
+
     def get_capital_flow_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:
         """资金流向块（fail-open）。"""
         from src.config import get_config
@@ -3710,27 +3723,70 @@ class DataFetcherManager:
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": 0}],
                 ["fundamental stage timeout"],
             )
-        payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(stock_code),
-            timeout,
-            "capital_flow",
-        )
-        if not isinstance(payload, dict):
+        # 资金流做「整块择一」，不用 earnings 区块那种字段级合并：
+        # main_net_inflow 与 inflow_5d/10d 必须同源同口径，混两源会产出口径不一致的组合值。
+        remaining_seconds = float(timeout)
+        merged_errors: List[str] = []
+        payload: Optional[Dict[str, Any]] = None
+        empty_payload: Optional[Dict[str, Any]] = None
+        cost_ms = 0
+        last_err: Optional[str] = None
+
+        # Tushare 优先：AkShare 的东财通道近期持续被限流，且结构上不提供 5日/10日净流入。
+        # 只给它一半预算——Tushare 慢调用若吃光整块预算，兜底源就再没机会跑（曾因此让
+        # AkShare 被饿死，整块直接 failed）。
+        tushare_budget = remaining_seconds / 2.0 if self._tushare_fundamental_adapter.is_available else 0.0
+        if tushare_budget > 0:
+            ts_payload, ts_err, ts_ms = self._run_with_retry(
+                lambda: self._tushare_fundamental_adapter.get_capital_flow(stock_code),
+                tushare_budget,
+                "tushare_capital_flow",
+            )
+            cost_ms += ts_ms
+            remaining_seconds = max(0.0, remaining_seconds - ts_ms / 1000.0)
+            if ts_err:
+                last_err = ts_err
+                merged_errors.append(f"tushare_capital_flow:{ts_err}")
+            if isinstance(ts_payload, dict):
+                merged_errors.extend(ts_payload.get("errors", []))
+                if self._capital_flow_has_content(ts_payload):
+                    payload = ts_payload
+                else:
+                    empty_payload = ts_payload
+            elif not ts_err:
+                merged_errors.append("tushare_capital_flow_failed")
+
+        # AkShare 兜底
+        if payload is None and remaining_seconds > 0:
+            ak_payload, ak_err, ak_ms = self._run_with_retry(
+                lambda: self._fundamental_adapter.get_capital_flow(stock_code),
+                min(timeout, remaining_seconds),
+                "capital_flow",
+            )
+            cost_ms += ak_ms
+            if ak_err:
+                last_err = ak_err
+                merged_errors.append(f"capital_flow:{ak_err}")
+            if isinstance(ak_payload, dict):
+                merged_errors.extend(ak_payload.get("errors", []))
+                payload = ak_payload
+            elif not ak_err:
+                merged_errors.append("capital_flow_failed")
+
+        # 两源都没给出可用数据时，保留先前那份结构完整但为空的 payload，
+        # 以便下面仍推导出 not_supported 而非一律 failed。
+        if payload is None:
+            payload = empty_payload
+        if payload is None:
             return self._build_fundamental_block(
                 "failed",
                 {},
                 [{"provider": "fundamental_pipeline", "result": "failed", "duration_ms": cost_ms}],
-                [err or "capital_flow failed"],
+                merged_errors or [last_err or "capital_flow failed"],
             )
 
-        stock_flow = payload.get("stock_flow") or {}
-        sector_rankings = payload.get("sector_rankings") or {}
-        has_stock_flow = False
-        if isinstance(stock_flow, dict):
-            has_stock_flow = any(v is not None for v in stock_flow.values())
-        has_sector_rankings = bool(sector_rankings.get("top")) or bool(sector_rankings.get("bottom"))
         adapter_status = str(payload.get("status", "not_supported"))
-        if has_stock_flow or has_sector_rankings:
+        if self._capital_flow_has_content(payload):
             capital_flow_status = "ok"
         elif adapter_status == "not_supported":
             capital_flow_status = "not_supported"
@@ -3749,7 +3805,7 @@ class DataFetcherManager:
                 capital_flow_status,
                 cost_ms,
             ),
-            list(payload.get("errors", [])) + ([err] if err else []),
+            merged_errors,
         )
 
     def get_dragon_tiger_context(self, stock_code: str, budget_seconds: Optional[float] = None) -> Dict[str, Any]:

@@ -493,28 +493,117 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(ctx["status"], "failed")
         self.assertEqual(ctx["data"], {})
 
-    def test_capital_flow_not_supported_status(self) -> None:
-        manager = DataFetcherManager(fetchers=[])
-        cfg = SimpleNamespace(
+    @staticmethod
+    def _capital_flow_cfg() -> SimpleNamespace:
+        return SimpleNamespace(
             enable_fundamental_pipeline=True,
             fundamental_cache_ttl_seconds=120,
             fundamental_stage_timeout_seconds=1.5,
             fundamental_fetch_timeout_seconds=0.8,
             fundamental_retry_max=1,
         )
-        with patch("src.config.get_config", return_value=cfg), \
+
+    @staticmethod
+    def _capital_flow_payload(*, main_net_inflow=None, sector_name=None, source="akshare"):
+        return {
+            "status": "partial" if main_net_inflow is not None or sector_name else "not_supported",
+            "stock_flow": {
+                "main_net_inflow": main_net_inflow,
+                "inflow_5d": None,
+                "inflow_10d": None,
+            },
+            "sector_rankings": {
+                "top": [{"name": sector_name, "net_inflow": 1.0e9}] if sector_name else [],
+                "bottom": [],
+            },
+            "source_chain": [f"capital_stock:{source}"],
+            "errors": [],
+        }
+
+    def test_capital_flow_not_supported_status(self) -> None:
+        manager = DataFetcherManager(fetchers=[])
+        empty = self._capital_flow_payload()
+        # 两源都要显式打桩：Tushare 未打桩时本机若配了 token 会走真实网络，
+        # 让这条离线用例变得不确定。
+        with patch("src.config.get_config", return_value=self._capital_flow_cfg()), \
+                patch(
+                    "data_provider.fundamental_adapter.TushareFundamentalAdapter.get_capital_flow",
+                    return_value=empty,
+                ), \
                 patch(
                     "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_capital_flow",
-                    return_value={
-                        "status": "not_supported",
-                        "stock_flow": {},
-                        "sector_rankings": {"top": [], "bottom": []},
-                        "source_chain": [],
-                        "errors": [],
-                    },
+                    return_value=empty,
                 ):
             ctx = manager.get_capital_flow_context("600519", budget_seconds=0.5)
         self.assertEqual(ctx["status"], "not_supported")
+
+    def test_capital_flow_prefers_tushare(self) -> None:
+        """Tushare 有数据时直接采用，不再调用 AkShare。"""
+        manager = DataFetcherManager(fetchers=[])
+        with patch("src.config.get_config", return_value=self._capital_flow_cfg()), \
+                patch(
+                    "data_provider.fundamental_adapter.TushareFundamentalAdapter.get_capital_flow",
+                    return_value=self._capital_flow_payload(
+                        main_net_inflow=7.05e8, sector_name="半导体设备", source="tushare_moneyflow"
+                    ),
+                ) as tushare_mock, \
+                patch(
+                    "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_capital_flow",
+                ) as akshare_mock:
+            manager._tushare_fundamental_adapter._api = object()
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=2.0)
+
+        self.assertEqual(ctx["status"], "ok")
+        self.assertAlmostEqual(ctx["data"]["stock_flow"]["main_net_inflow"], 7.05e8, places=2)
+        self.assertEqual(tushare_mock.call_count, 1)
+        self.assertEqual(akshare_mock.call_count, 0)
+        providers = [entry.get("provider") for entry in ctx["source_chain"]]
+        self.assertIn("capital_stock:tushare_moneyflow", providers)
+
+    def test_capital_flow_falls_back_to_akshare_when_tushare_empty(self) -> None:
+        """Tushare 无数据时落 AkShare，且两源的 errors 都要保留以便排障。"""
+        manager = DataFetcherManager(fetchers=[])
+        tushare_empty = self._capital_flow_payload()
+        tushare_empty["errors"] = ["moneyflow_api_failed"]
+        with patch("src.config.get_config", return_value=self._capital_flow_cfg()), \
+                patch(
+                    "data_provider.fundamental_adapter.TushareFundamentalAdapter.get_capital_flow",
+                    return_value=tushare_empty,
+                ), \
+                patch(
+                    "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_capital_flow",
+                    return_value=self._capital_flow_payload(main_net_inflow=-1.2e8),
+                ) as akshare_mock:
+            manager._tushare_fundamental_adapter._api = object()
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=2.0)
+
+        self.assertEqual(ctx["status"], "ok")
+        self.assertAlmostEqual(ctx["data"]["stock_flow"]["main_net_inflow"], -1.2e8, places=2)
+        self.assertEqual(akshare_mock.call_count, 1)
+        self.assertIn("moneyflow_api_failed", ctx["errors"])
+
+    def test_capital_flow_akshare_not_starved_by_slow_tushare(self) -> None:
+        """Tushare 慢到超时也不能吃光预算——兜底源必须仍被调用。"""
+        manager = DataFetcherManager(fetchers=[])
+
+        def _slow(*_args, **_kwargs):
+            time.sleep(2.0)
+            return self._capital_flow_payload(main_net_inflow=1.0)
+
+        with patch("src.config.get_config", return_value=self._capital_flow_cfg()), \
+                patch(
+                    "data_provider.fundamental_adapter.TushareFundamentalAdapter.get_capital_flow",
+                    side_effect=_slow,
+                ), \
+                patch(
+                    "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_capital_flow",
+                    return_value=self._capital_flow_payload(main_net_inflow=-3.4e8),
+                ) as akshare_mock:
+            manager._tushare_fundamental_adapter._api = object()
+            ctx = manager.get_capital_flow_context("600519", budget_seconds=1.0)
+
+        self.assertEqual(akshare_mock.call_count, 1)
+        self.assertAlmostEqual(ctx["data"]["stock_flow"]["main_net_inflow"], -3.4e8, places=2)
 
     def test_get_belong_boards_from_capability_probe(self) -> None:
         fetcher = _DummyBoardFetcher(

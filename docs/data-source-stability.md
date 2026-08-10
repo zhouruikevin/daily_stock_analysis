@@ -24,6 +24,9 @@
 | AlphaSift 日线补特征 | DSA `DataFetcherManager` | AlphaSift 调用 DSA provider context，优先复用 DSA 日线与缓存链路 | DSA 链路失败后才回到 AlphaSift 原始日线源 |
 | AlphaSift 热点题材 | DSA EastMoney provider、AlphaSift hotspot、last-good cache | 未指定 provider 时默认使用 DSA EastMoney provider | 实时失败时回退热点缓存；无缓存时返回稳定空态和可读错误 |
 | 港股 / 美股 | Longbridge、YFinance、AkShare、Tushare、Finnhub、AlphaVantage、Stooq | 配置 Longbridge 凭证后参与港美股日线/实时兜底；YFinance 保持基础兜底 | Longbridge 冷却或失败时回退 YFinance / 其他可用源 |
+| A 股资金流（个股 + 板块） | Tushare（`moneyflow` / `moneyflow_ind_dc` / `moneyflow_ind_ths`）、AkShare（东财） | 配置 `TUSHARE_TOKEN` 后优先 Tushare（板块内部再按东财 `_dc` → 同花顺 `_ths` 兜底）；仅 A 股非 ETF 支持 | Tushare 无 token / 失败 / 无数据时回退 AkShare；两源都失败时该块降级，只影响护栏的资金面确认，不阻断分析主流程 |
+
+> 资金流被分析护栏用作「操作建议过滤器」：买入结论需要资金面确认，因此该块的可用性会直接影响最终评分与操作建议。Tushare 侧金额单位为万元（板块 `_ths` 为亿元），适配层统一换算为元后输出，与 AkShare 东财口径一致；`main_net_inflow` 按东财「主力净流入」定义取超大单 + 大单净额。
 
 ## 总体链路图
 
