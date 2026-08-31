@@ -1,277 +1,103 @@
 ---
 name: stock-analysis
 description: >
-  Analyze A-share, Hong Kong, or US stocks using AI-powered technical analysis.
-  Use when the user asks to analyze stocks, check stock trends, get trading signals,
-  perform market review, or mentions stock codes like 600519, hk00700, AAPL.
-  Supports single stock, multiple stocks, and market overview.
-  Works with Qoder IDE, Claude, and other AI platforms.
+  用 Qoder（qodercli）经项目原分析管道分析 A股/港股/美股并发合并邮件。
+  当用户要分析股票、分析关注列表/自选股、看走势、要交易信号，或提到股票代码
+  （如 600519、hk00700、AAPL）时调用。自动启动 LLM 代理、实时反馈每只进度。
 ---
 
-# Stock Analysis Skill
+# 股票分析 Skill（Qoder 大脑 + 原管道）
 
-跨平台股票分析技能,支持 A股/港股/美股智能分析。
+用 **Qoder（qodercli）** 作为分析大脑，**沿用项目原分析管道**（`analyze_stock`）产出报告——
+舆情/业绩预期/风险/利好、当日行情、数据透视、作战计划、财务摘要、关联板块全部由原管道原生生成，
+与百炼版报告结构完全一致。分析结果自动存库（分析历史/决策信号/指数），最后发一封合并邮件。
 
-## ⛔ 执行约束（必须遵守）
+## 执行方式
 
-1. **不要向用户询问任何配置信息**。所有配置（LLM 模型、API Key、数据源等）已预置在项目 `.env` 文件中，直接使用即可。
-2. **不要提示"缺少核心代码文件"**。本 Skill 是项目的组成部分，代码就在项目目录中，Skill 目录只存放 Skill 描述文件。
-3. **不要询问"使用哪个 LLM 提供商和模型"**。LLM 配置已在 `.env` 中设定（当前为 `openai/glm-4.6`），无需用户干预。
-4. **分析时间较长时（超过 60 秒），每隔约 1 分钟向用户反馈一次进度**，不要沉默等待。
-5. **直接执行分析，不要问"是否需要启动服务"之类的确认**。如果服务未运行，自动启动即可。
-6. **使用 Skill 分析股票时默认不进行大盘复盘**。只分析用户指定的股票，不触发 `--market-review`，除非用户明确要求。
+**唯一入口脚本**：`scripts/analyze_with_qoder.sh`（自动拉起 qoder_llm_proxy，无需手动启动服务）。
 
-## 项目信息
+### 1. 确定分析范围
 
-- **项目路径**：`/Users/eleme/Documents/ai/qoderwork/daily_stock_analysis`
-- **LLM 配置**：已在项目 `.env` 中配置（`LITELLM_MODEL=openai/glm-4.6`）
-- **数据源**：AkShare（免费默认）+ 可选 Tushare/Longbridge
-- **Skill 目录只是文档**：`.qoder/skills/stock-analysis/` 仅存放 Skill 描述，核心代码在 `src/`、`data_provider/` 等目录
+- 用户说"分析关注列表 / 自选股 / STOCK_LIST" 或未指定具体代码 → **不带参数**（脚本读 `.env` 的 `STOCK_LIST`）。
+- 用户给了具体代码 → 作为第一个参数，逗号分隔，如 `600519,603444`。
+- 用户说"先别发邮件 / 只看不发 / 联调" → 前面加 `NO_EMAIL=1`。
 
-## 快速开始
+### 2. 后台启动分析并实时监控进度
 
-### 0. 确保服务运行（首次必做）
+**必须后台运行 + 读取日志汇报进度**，不要前台干等。
 
-**自动启动服务**：
-```bash
-# 使用管理脚本（推荐）
-bash scripts/manage_service.sh start
-
-# 或手动启动
-python main.py --serve-only
-```
-
-**服务管理**：
-```bash
-bash scripts/manage_service.sh status   # 查看状态
-bash scripts/manage_service.sh stop     # 停止服务
-bash scripts/manage_service.sh restart  # 重启服务
-```
-
-**服务地址**：`http://localhost:8000`  
-**日志位置**：`/tmp/dsa_server.log`
-
-**⚠️ 重要：Skill 执行分析时默认跳过大盘复盘**
-- 用户要求分析股票时，只分析指定的股票
-- 只有用户明确要求「大盘复盘」、「市场综述」、「market review」时，才执行 `python main.py --market-review`
-- 这样可以节省 2-3 分钟分析时间
-
-### 执行优先级
-
-1. **优先使用 Python import** (最快,功能完整)
-2. **降级到 API** (如果依赖缺失但服务运行中)
-3. **最后使用 CLI** (兜底方案)
-
-运行前执行依赖检查:
-```bash
-python scripts/check_deps.py
-```
-
-### 方式 A: Python Import (推荐)
-
-```python
-from analyzer_service import analyze_stock, analyze_stocks, perform_market_review
-
-# 单只股票分析
-result = analyze_stock("600519", full_report=False)
-if result:
-    print(f"股票: {result.name} ({result.code})")
-    print(f"核心结论: {result.dashboard['core_conclusion']['one_sentence']}")
-    print(f"操作建议: {result.operation_advice}")
-    print(f"情绪得分: {result.sentiment_score}")
-
-# 多只股票批量分析
-results = analyze_stocks(["600519", "000001", "AAPL"])
-
-# 大盘复盘
-report = perform_market_review()
-if report:
-    print(report)
-```
-
-### 方式 B: HTTP API
-
-```python
-import requests
-
-# 单只股票
-response = requests.post(
-    "http://localhost:8000/api/v1/analysis/analyze",
-    json={"stock_codes": ["600519"], "full_report": False}
-)
-result = response.json()
-
-# 查询任务状态 (异步分析)
-status = requests.get("http://localhost:8000/api/v1/analysis/status/{task_id}")
-```
-
-### 方式 C: CLI 命令
+使用 Bash 后台启动，输出重定向到日志：
 
 ```bash
-# 单只股票（默认不进行大盘复盘）
-python main.py --stocks 600519 --no-market-review
-
-# 多只股票（默认不进行大盘复盘）
-python main.py --stocks 600519,000001,AAPL --no-market-review
-
-# 大盘复盘（仅当用户明确要求时执行）
-python main.py --market-review
+bash scripts/analyze_with_qoder.sh > /tmp/qoder_stock_run.log 2>&1
 ```
 
-## 输出格式
+（分析指定股票：`bash scripts/analyze_with_qoder.sh 600519,603444 > /tmp/qoder_stock_run.log 2>&1`）
 
-分析返回 `AnalysisResult` 对象,关键结构:
+然后用 **Read 或 GetTerminalOutput** 读取日志，把进度行逐条转达给用户：
 
-```python
-result.dashboard = {
-    "core_conclusion": {
-        "one_sentence": "一句话核心结论",
-        "signal_type": "buy|hold|sell",
-        "position_advice": "仓位建议"
-    },
-    "battle_plan": {
-        "sniper_points": {
-            "ideal_buy": 10.5,      # 理想买入价
-            "secondary_buy": 10.2,  # 次要买入价
-            "stop_loss": 9.8,       # 止损价
-            "take_profit": 12.0     # 目标价
-        }
-    }
-}
-
-# 其他关键字段
-result.sentiment_score      # 情绪得分 0-100
-result.operation_advice     # 操作建议
-result.confidence_level     # 置信度
+```
+cat /tmp/qoder_stock_run.log | grep -E "\|\[进度\|\■\|\📧\|失败\|异常\|不可用"
 ```
 
-**标准展示格式**:
-```
-📊 [股票名称] [代码]
-💡 核心结论: [一句话]
-🎯 狙击点: 买入 ¥XX | 止损 ¥XX | 目标 ¥XX
-📈 情绪得分: XX/100
-💼 操作建议: [买入/持有/卖出]
+进度行格式：
+- `[qoder] ▶ 开始分析 N 只 ...` —— 开始
+- `[进度 3/19] 603444 吉比特 ✅ 评分65 持有 (累计128s)` —— 每只完成
+- `[qoder] ■ 分析完成 用时...成功 N/19` —— 全部完成
+- `[qoder] 📧 合并邮件已发送（N只）+ 报告已存 reports/` —— 邮件已发
+
+### 3. 汇报结果
+
+分析完成后向用户汇报：成功/失败数量、买入/持有/卖出分布、邮件是否发送、报告路径（`reports/`）。
+如有 FAIL 的股票，如实列出。
+
+## 执行约束
+
+1. **不要询问配置**：数据源、邮件、模型都已就绪；直接执行。
+2. **不要手动启代理**：脚本会自动检测并拉起 `qoder_llm_proxy.py`。
+3. **必须后台跑 + 读日志汇报进度**：让用户随时看到"跑到第几只"，不要闷头等。
+4. **默认发合并邮件**，不额外询问；用户明确说不发才加 `NO_EMAIL=1`。
+5. **模型默认 `DeepSeek-V4-Flash`**，由脚本的 `LITELLM_MODEL=openai/deepseek-v4-flash` 控制；需要换模型时加 `QODER_PROXY_MODEL=...` 环境变量。
+
+## 常用命令速查
+
+```bash
+# 关注列表 + 发邮件（最常用）
+bash scripts/analyze_with_qoder.sh
+
+# 指定股票 + 发邮件
+bash scripts/analyze_with_qoder.sh 600519,603444,AAPL
+
+# 只分析存库不发邮件（联调）
+NO_EMAIL=1 bash scripts/analyze_with_qoder.sh 603444
+
+# 提高并发（默认 4）
+MAX_WORKERS=5 bash scripts/analyze_with_qoder.sh
 ```
 
-## 支持的股票市场
+## 支持的市场
 
 | 市场 | 代码格式 | 示例 |
 |------|---------|------|
-| A股 | 6位数字 | `600519`, `000001`, `300750` |
-| 港股 | hk + 5位数字 | `hk00700`, `hk09988` |
-| 美股 | 股票代码 | `AAPL`, `TSLA`, `NVDA` |
-| 美股指数 | 指数代码 | `SPX`, `DJI`, `IXIC` |
+| A股 | 6位数字 | 600519, 000001, 300750 |
+| 港股 | hk+5位数字 | hk00700, hk09988 |
+| 美股 | 字母代码 | AAPL, TSLA, NVDA |
 
-## 配置要求
+## 关键文件
 
-### 必须配置
-- `LITELLM_MODEL`: LLM 模型名称 (如 `gpt-4`, `deepseek-chat`)
-- `LITELLM_API_KEY`: LLM API Key
-
-### 可选配置 (数据源)
-- `TUSHARE_TOKEN`: Tushare 数据源 (A股)
-- `LONGBRIDGE_APP_KEY`: Longbridge 数据源 (港股/美股)
-- AkShare: 免费,无需配置 (默认数据源)
-
-配置文件位置: `.env` (复制 `.env.example` 并填写)
+- 入口脚本：`scripts/analyze_with_qoder.sh`（自动拉代理 + 逐只进度 + 合并邮件）
+- LLM 代理：`scripts/qoder_llm_proxy.py`（OpenAI 兼容，转发到本地 qodercli）
+- 关注列表：`.env` 的 `STOCK_LIST`
+- 邮件配置：`.env` 的 `EMAIL_SENDER / EMAIL_PASSWORD / EMAIL_RECEIVERS`
+- 分析管道：`src/services/analyzer_service.py` -> `src/core/pipeline.py`（原管道，未改动）
 
 ## 故障排查
 
-| 问题 | 解决方案 |
-|------|---------|
-| 依赖缺失 | `pip install -r requirements.txt` |
-| LLM 未配置 | 在 `.env` 中设置 `LITELLM_MODEL` 和 `LITELLM_API_KEY` |
-| 数据源失败 | 分析会继续使用可用数据源 (fail-open 设计) |
-| API 服务未运行 | 使用 Python import 模式或执行 `python server.py` 启动 |
-| 超时 | 单只股票通常 10-30 秒,批量分析建议使用异步模式 |
-| 股票代码错误 | 检查格式:A股6位数字,港股加 hk 前缀,美股用字母代码 |
-
-## 高级用法
-
-### 选择分析策略
-
-```python
-from src.config import get_config
-
-config = get_config()
-config.agent_skills = ["ma_cross", "volume_breakout"]  # 指定策略
-
-result = analyze_stock("600519", config=config)
-```
-
-### 完整报告 vs 简要报告
-
-```python
-# 简要报告 (快速,适合批量)
-result = analyze_stock("600519", full_report=False)
-
-# 完整报告 (详细,包含基本面、新闻等)
-result = analyze_stock("600519", full_report=True)
-```
-
-### 自定义通知
-
-**重要**: 默认情况下分析不会发送邮件,需要手动传入 `notifier` 参数。
-
-#### 单只股票通知
-
-```python
-from analyzer_service import analyze_stock
-from src.notification import NotificationService
-
-# 创建通知服务 (从 .env 读取邮件配置)
-notifier = NotificationService()
-
-# 分析并发送邮件
-result = analyze_stock("600519", notifier=notifier)
-```
-
-#### 批量分析合并通知
-
-批量分析时,默认会将所有股票的分析结果合并为一封汇总邮件发送:
-
-```python
-from analyzer_service import analyze_stocks
-from src.notification import NotificationService
-
-notifier = NotificationService()
-
-# 默认行为: 合并为一封汇总邮件
-results = analyze_stocks(["600519", "000001"], notifier=notifier)
-
-# 禁用合并: 每只股票单独发送一封邮件
-results = analyze_stocks(["600519", "000001"], notifier=notifier, merge_notification=False)
-```
-
-**参数说明**:
-- `merge_notification=True` (默认): 所有股票分析完成后,合并为一封汇总邮件发送
-- `merge_notification=False`: 每只股票分析完成后立即发送邮件
-
-**邮件配置要求** (在 `.env` 中配置):
-```bash
-EMAIL_SENDER=your_email@example.com      # 发件人邮箱
-EMAIL_PASSWORD=your_app_password         # 邮箱授权码
-EMAIL_RECEIVERS=receiver@example.com     # 收件人邮箱
-```
-
-支持的邮件服务:
-- 163邮箱 (推荐,免费稳定)
-- QQ邮箱
-- Gmail (需要开启两步验证)
-- 企业邮箱 (QQ企业、阿里企业等)
-
-**注意**: 如果不传入 `notifier` 参数,分析仍会正常进行,只是不会发送邮件通知。
-
-## 相关资源
-
-- 详细 API 文档: [REFERENCE.md](REFERENCE.md)
-- 多平台部署示例: [EXAMPLES.md](EXAMPLES.md)
-- 项目完整指南: `docs/full-guide.md`
-- 配置示例: `.env.example`
-
-## 版本信息
-
-- Skill 版本: 1.0.0
-- 最低项目版本: 与当前仓库版本兼容
-- 更新日期: 2026-04-16
+| 现象 | 处理 |
+|------|------|
+| 代理启动失败 | 看 `/tmp/qoder_proxy.log`；确认 `qodercli` 已安装并登录（`qodercli --list-models` 能正常返回） |
+| 某只 FAIL | 数据源缺失或网络抖动，脚本 fail-open 继续其余；可单独重跑该只 |
+| 模型报错 | 检查 `.env` 的 `LITELLM_MODEL` 和 `QODER_PROXY_MODEL` 是否有效 |
+| 全部股票 FAIL | 检查 qoder_llm_proxy 是否在运行；`curl http://127.0.0.1:8765/health` |
+| 邮件未收到 | 检查 `.env` EMAIL_* 配置；`is_available()` 为假会跳过发送 |
+| 分析很慢 | qodercli 调用约 30-120s/只；想更快提高 `MAX_WORKERS`（注意数据源限流） |

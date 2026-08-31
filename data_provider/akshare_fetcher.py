@@ -2203,9 +2203,11 @@ class AkshareFetcher(BaseFetcher):
                     for _, row in bottom.iterrows()
                 ],
             )
-        except Exception as e:
-            logger.warning(f"[Akshare] 获取概念排行失败: {e}")
-            return None
+        except Exception:
+            # 概念排行只有本 fetcher 一个真实实现，这里 return None 会被 DataFetcherManager
+            # 当成“数据为空”，真正的根因（如东财限流的 RemoteDisconnected）就只剩一行孤立日志。
+            # 交给管理器统一记录并作为首个真实错误上报，None 仅保留“确实没数据”的语义。
+            raise
 
     def get_hot_stocks(self, n: int = 10) -> Optional[List[Dict[str, Any]]]:
         """获取人气股榜，按免配置热榜数据源降级。"""

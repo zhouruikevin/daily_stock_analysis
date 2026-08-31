@@ -605,6 +605,34 @@ class TestFundamentalContext(unittest.TestCase):
         self.assertEqual(akshare_mock.call_count, 1)
         self.assertAlmostEqual(ctx["data"]["stock_flow"]["main_net_inflow"], -3.4e8, places=2)
 
+    def test_capital_flow_gives_tushare_majority_of_budget(self) -> None:
+        """Tushare 是唯一稳定有数据的源（AkShare 东财通道长期被限流），
+        预算不能再 50/50 对切——实测那 4 只被夹分的股票正是 Tushare 卡在半额 4s 上。
+        """
+        manager = DataFetcherManager(fetchers=[])
+        budgets: list = []
+        real_run = manager._run_with_retry
+
+        def _spy(fn, budget, label):
+            budgets.append((label, budget))
+            return real_run(fn, budget, label)
+
+        with patch("src.config.get_config", return_value=self._capital_flow_cfg()), \
+                patch.object(manager, "_run_with_retry", side_effect=_spy), \
+                patch(
+                    "data_provider.fundamental_adapter.TushareFundamentalAdapter.get_capital_flow",
+                    return_value=self._capital_flow_payload(main_net_inflow=1.0),
+                ):
+            manager._tushare_fundamental_adapter._api = object()
+            manager.get_capital_flow_context("600519", budget_seconds=8.0)
+
+        tushare_budget = dict(budgets).get("tushare_capital_flow")
+        self.assertIsNotNone(tushare_budget)
+        self.assertGreater(
+            tushare_budget, 4.0, "Tushare 应拿到多数预算，而不是原来的一半(4.0s)"
+        )
+        self.assertLess(tushare_budget, 8.0, "必须给兜底源留余量，不能吃光整块预算")
+
     def test_get_belong_boards_from_capability_probe(self) -> None:
         fetcher = _DummyBoardFetcher(
             "EfinanceFetcher",

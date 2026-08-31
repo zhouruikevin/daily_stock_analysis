@@ -5,10 +5,12 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 from unittest.mock import MagicMock
 
 from api.v1.schemas.history import ReportDetails
-from data_provider.base import DataFetcherManager
+from data_provider import base as base_module
+from data_provider.base import BaseFetcher, DataFetcherManager
 from src.core.pipeline import StockAnalysisPipeline
 from src.services.market_hotspot_service import MarketHotspotService
 from src.services.market_structure_service import MarketStructureService
@@ -412,6 +414,147 @@ class PipelineRelatedBoardsTestCase(unittest.TestCase):
 
         self.assertEqual(enriched["belong_boards"], [{"name": "白酒"}])
         pipeline.fetcher_manager.get_belong_boards.assert_called_once_with("SH600519")
+
+
+class _FailingConceptRankingFetcher:
+    name = "FailingConceptRankingFetcher"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_concept_rankings(self, n: int = 5):
+        self.calls += 1
+        raise ConnectionError("Remote end closed connection without response")
+
+
+class _UnimplementedConceptRankingFetcher(BaseFetcher):
+    """未覆写概念排行的数据源，沿用基类默认的 None 返回。"""
+
+    name = "UnimplementedConceptRankingFetcher"
+
+    def _fetch_raw_data(self, *args, **kwargs):  # pragma: no cover - 测试占位
+        return None
+
+    def _normalize_data(self, *args, **kwargs):  # pragma: no cover - 测试占位
+        return None
+
+
+class ConceptRankingsFallbackTestCase(unittest.TestCase):
+    """概念排行只有 Akshare 一个真实实现，失败时不能被无实现数据源掩盖根因。"""
+
+    def tearDown(self) -> None:
+        DataFetcherManager.clear_concept_rankings_cache_for_tests()
+
+    def _manager(self, fetchers):
+        manager = DataFetcherManager.__new__(DataFetcherManager)
+        manager._fetchers = fetchers
+        return manager
+
+    def test_unimplemented_fetcher_does_not_mask_real_error(self) -> None:
+        failing = _FailingConceptRankingFetcher()
+        manager = self._manager([failing, _UnimplementedConceptRankingFetcher()])
+
+        with self.assertLogs("data_provider.base", level="WARNING") as captured:
+            self.assertEqual(manager.get_concept_rankings(5), ([], []))
+
+        summary = [line for line in captured.output if "所有数据源均失败" in line]
+        self.assertEqual(len(summary), 1)
+        # 根因必须是 Akshare 侧的连接错误，而不是无实现数据源的“返回空结果”
+        self.assertIn("FailingConceptRankingFetcher", summary[0])
+        self.assertIn("Remote end closed connection", summary[0])
+        self.assertNotIn("UnimplementedConceptRankingFetcher返回空结果", summary[0])
+
+    def test_unimplemented_fetcher_is_not_invoked(self) -> None:
+        unimplemented = _UnimplementedConceptRankingFetcher()
+        manager = self._manager([unimplemented])
+
+        with self.assertLogs("data_provider.base", level="WARNING") as captured:
+            self.assertEqual(manager.get_concept_rankings(5), ([], []))
+
+        self.assertTrue(
+            any("无数据源实现" in line for line in captured.output),
+            f"应明确提示无实现，实际日志: {captured.output}",
+        )
+
+    def test_failed_lookup_is_cached_long_enough_to_avoid_hammering(self) -> None:
+        """限流是按 IP 粘性的，失败缓存过短会让单轮分析内反复叩门。"""
+        failing = _FailingConceptRankingFetcher()
+        manager = self._manager([failing])
+
+        clock = {"now": 1000.0}
+        # 只替换 base.py 引用的 time 名字，避免把全局 time.monotonic 也改掉
+        fake_time = mock.Mock(wraps=time)
+        fake_time.monotonic = lambda: clock["now"]
+        with mock.patch.object(base_module, "time", fake_time):
+            manager.get_concept_rankings(5)
+            self.assertEqual(failing.calls, 1)
+
+            # 单轮分析常见跨度（本轮 16 只跑了约 905s），60s 后不应重新打接口
+            clock["now"] += 60.0
+            manager.get_concept_rankings(5)
+            self.assertEqual(failing.calls, 1)
+
+    def test_akshare_propagates_network_error_instead_of_returning_none(self) -> None:
+        """Akshare 是概念排行唯一真实实现，吞掉异常会让管理器把限流误判成“数据为空”。"""
+        from data_provider.akshare_fetcher import AkshareFetcher
+
+        fetcher = AkshareFetcher.__new__(AkshareFetcher)
+        fetcher._set_random_user_agent = lambda: None
+        fetcher._enforce_rate_limit = lambda: None
+
+        boom = ConnectionError("Remote end closed connection without response")
+        with mock.patch(
+            "akshare.stock_board_concept_name_em", side_effect=boom
+        ):
+            with self.assertRaises(ConnectionError):
+                fetcher.get_concept_rankings(5)
+
+    def test_empty_upstream_data_still_reported_as_empty_not_failure(self) -> None:
+        """区分“确实没数据”和“取数失败”：空 DataFrame 仍应是 None，不应抛异常。"""
+        import pandas as pd
+
+        from data_provider.akshare_fetcher import AkshareFetcher
+
+        fetcher = AkshareFetcher.__new__(AkshareFetcher)
+        fetcher._set_random_user_agent = lambda: None
+        fetcher._enforce_rate_limit = lambda: None
+
+        with mock.patch(
+            "akshare.stock_board_concept_name_em", return_value=pd.DataFrame()
+        ):
+            self.assertIsNone(fetcher.get_concept_rankings(5))
+
+    def test_akshare_failure_reason_reaches_summary_log(self) -> None:
+        """端到端：管理器摘要行必须带上 Akshare 的真实失败原因，而不是“返回空结果”。"""
+        from data_provider.akshare_fetcher import AkshareFetcher
+
+        fetcher = AkshareFetcher.__new__(AkshareFetcher)
+        fetcher._set_random_user_agent = lambda: None
+        fetcher._enforce_rate_limit = lambda: None
+        manager = self._manager([fetcher, _UnimplementedConceptRankingFetcher()])
+
+        boom = ConnectionError("Remote end closed connection without response")
+        with mock.patch("akshare.stock_board_concept_name_em", side_effect=boom):
+            with self.assertLogs("data_provider.base", level="WARNING") as captured:
+                self.assertEqual(manager.get_concept_rankings(5), ([], []))
+
+        summary = [line for line in captured.output if "所有数据源均失败" in line]
+        self.assertEqual(len(summary), 1)
+        self.assertIn("Remote end closed connection", summary[0])
+        self.assertNotIn("AkshareFetcher返回空结果", summary[0])
+
+    def test_successful_lookup_short_circuits_remaining_fetchers(self) -> None:
+        failing = _FailingConceptRankingFetcher()
+        working = _SlowConceptRankingFetcher()
+        manager = self._manager([failing, working])
+
+        top, bottom = manager.get_concept_rankings(5)
+
+        self.assertEqual(top[0]["name"], "top-5")
+        self.assertEqual(bottom[0]["name"], "bottom-5")
+        self.assertEqual(failing.calls, 1)
+        self.assertEqual(working.calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

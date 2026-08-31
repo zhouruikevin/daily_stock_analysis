@@ -655,8 +655,12 @@ class DataFetcherManager:
         "AlphaVantageFetcher": {"us"},
     }
     _daily_source_health = CircuitBreaker(failure_threshold=3, cooldown_seconds=300.0)
+    # 资金流预算给 Tushare 的占比，余量留给 AkShare 兜底（详见 get_capital_flow_context）
+    _CAPITAL_FLOW_TUSHARE_BUDGET_RATIO = 0.75
     _CONCEPT_RANKINGS_CACHE_TTL_SECONDS = 300.0
-    _CONCEPT_RANKINGS_EMPTY_CACHE_TTL_SECONDS = 30.0
+    # 东财 push2 接口按 IP 粘性限流，失败后短 TTL 会让单轮分析内反复重试并持续加压，
+    # 因此与成功 TTL 及 _daily_source_health 的 cooldown 保持一致。
+    _CONCEPT_RANKINGS_EMPTY_CACHE_TTL_SECONDS = 300.0
     _concept_rankings_cache_lock = RLock()
     _concept_rankings_cache: Dict[int, Tuple[float, List[Dict], List[Dict]]] = {}
 
@@ -3732,10 +3736,16 @@ class DataFetcherManager:
         cost_ms = 0
         last_err: Optional[str] = None
 
-        # Tushare 优先：AkShare 的东财通道近期持续被限流，且结构上不提供 5日/10日净流入。
-        # 只给它一半预算——Tushare 慢调用若吃光整块预算，兜底源就再没机会跑（曾因此让
-        # AkShare 被饿死，整块直接 failed）。
-        tushare_budget = remaining_seconds / 2.0 if self._tushare_fundamental_adapter.is_available else 0.0
+        # Tushare 优先：AkShare 的东财通道近期持续被限流（实测个股段与板块段全部
+        # ConnectionError，6-11s 都花在失败重试上），且结构上不提供 5日/10日净流入。
+        # 按比例而非固定值切分，保证兜底源在任何总预算下都还能拿到余量、不被饿死；
+        # 但不再 50/50——把上限扣在唯一稳定有数据的主源上，只会让它卡在半额预算上超时，
+        # 再由买入降级护栏静默扣掉 5-15 分（实测一轮 17 只里有 4 只因此被夹到 59）。
+        tushare_budget = (
+            remaining_seconds * self._CAPITAL_FLOW_TUSHARE_BUDGET_RATIO
+            if self._tushare_fundamental_adapter.is_available
+            else 0.0
+        )
         if tushare_budget > 0:
             ts_payload, ts_err, ts_ms = self._run_with_retry(
                 lambda: self._tushare_fundamental_adapter.get_capital_flow(stock_code),
@@ -4007,22 +4017,42 @@ class DataFetcherManager:
 
             top: List[Dict] = []
             bottom: List[Dict] = []
+            unimplemented: List[str] = []
             for fetcher in self._get_fetchers_snapshot():
+                fetcher_name = getattr(fetcher, "name", type(fetcher).__name__)
+                # 目前仅 Akshare 覆写了该接口，其余数据源沿用基类的 None 返回。
+                # 若不跳过，它们的“返回空结果”会把上游真正的失败原因覆盖掉。
+                impl = getattr(type(fetcher), "get_concept_rankings", None)
+                if impl is None or impl is BaseFetcher.get_concept_rankings:
+                    unimplemented.append(fetcher_name)
+                    continue
                 try:
                     data = fetcher.get_concept_rankings(normalized_n)
                     if data and (data[0] or data[1]):
                         top = data[0] or []
                         bottom = data[1] or []
-                        logger.info(f"[{fetcher.name}] 获取概念排行成功")
+                        logger.info(f"[{fetcher_name}] 获取概念排行成功")
                         break
-                    last_error = f"{fetcher.name}返回空结果"
+                    if not last_error:
+                        last_error = f"{fetcher_name}返回空结果"
                 except Exception as e:
                     error_type, error_reason = summarize_exception(e)
-                    last_error = f"{fetcher.name} ({error_type}) {error_reason}"
-                    logger.warning(f"[{fetcher.name}] 获取概念排行失败: {error_reason}")
+                    if not last_error:
+                        last_error = f"{fetcher_name} ({error_type}) {error_reason}"
+                    logger.warning(f"[{fetcher_name}] 获取概念排行失败: {error_reason}")
 
-            if not top and not bottom and last_error:
-                logger.warning(f"[概念排行] 所有数据源均失败，最终错误: {last_error}")
+            if not top and not bottom:
+                skipped_hint = (
+                    f"；未实现该接口已跳过: {', '.join(unimplemented)}" if unimplemented else ""
+                )
+                if last_error:
+                    logger.warning(
+                        f"[概念排行] 所有数据源均失败，首个错误: {last_error}{skipped_hint}"
+                    )
+                elif unimplemented:
+                    logger.warning(
+                        f"[概念排行] 无数据源实现该接口: {', '.join(unimplemented)}"
+                    )
 
             ttl = (
                 self.__class__._CONCEPT_RANKINGS_CACHE_TTL_SECONDS

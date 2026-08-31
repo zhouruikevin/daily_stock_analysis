@@ -329,6 +329,14 @@ class TestTushareCapitalFlow(unittest.TestCase):
     ]
     _NET_MF_AMOUNT_DECOY = 777777.0
 
+    def setUp(self) -> None:
+        # 板块榜缓存是类级共享的，用例间必须清空，否则前一条用例缓存的 DC 结果
+        # 会让「DC 挂掉降级 THS」这类用例拿到陈旧数据而假通过。
+        TushareFundamentalAdapter.clear_sector_flow_cache_for_tests()
+
+    def tearDown(self) -> None:
+        TushareFundamentalAdapter.clear_sector_flow_cache_for_tests()
+
     def _moneyflow_df(self) -> pd.DataFrame:
         rows = []
         for trade_date, main_net_wan in self._DAILY_MAIN_NET_WAN:
@@ -458,6 +466,81 @@ class TestTushareCapitalFlow(unittest.TestCase):
 
         self.assertEqual(result["status"], "not_supported")
         self.assertIn("moneyflow_api_failed", result["errors"])
+
+    def _counting_adapter(self, calls: list) -> TushareFundamentalAdapter:
+        """记录每次 _call_api 的接口名，用于验证板块榜只拉一次。"""
+        adapter = TushareFundamentalAdapter()
+        adapter._api = object()
+        table = {"moneyflow": self._moneyflow_df(), "moneyflow_ind_dc": self._dc_df()}
+
+        def _fake(api_name, **_kwargs):
+            calls.append(api_name)
+            return table.get(api_name)
+
+        patcher = patch.object(adapter, "_call_api", side_effect=_fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return adapter
+
+    def test_sector_rankings_fetched_once_across_stocks(self) -> None:
+        """板块资金流对同一交易日的所有个股完全相同，17 只不该拉 17 次。"""
+        calls: list = []
+        adapter = self._counting_adapter(calls)
+
+        for code in ("600519", "002463", "002371"):
+            result = adapter.get_capital_flow(code)
+            self.assertEqual(result["sector_rankings"]["top"][0]["name"], "半导体设备")
+            self.assertIn("capital_sector:tushare_moneyflow_ind_dc", result["source_chain"])
+
+        self.assertEqual(calls.count("moneyflow"), 3, "个股资金流必须每只都取")
+        self.assertEqual(calls.count("moneyflow_ind_dc"), 1, "板块榜应命中缓存只取一次")
+
+    def test_sector_rankings_cache_isolated_by_trade_date(self) -> None:
+        """跨交易日不能复用：换日必须重新取，否则会拿昨天的板块榜。"""
+        calls: list = []
+        adapter = self._counting_adapter(calls)
+        adapter.get_capital_flow("600519")
+        self.assertEqual(calls.count("moneyflow_ind_dc"), 1)
+
+        TushareFundamentalAdapter.clear_sector_flow_cache_for_tests()
+        adapter.get_capital_flow("600519")
+        self.assertEqual(calls.count("moneyflow_ind_dc"), 2)
+
+    def test_cached_sector_rankings_are_copied_not_shared(self) -> None:
+        """缓存必须发拷贝：上层改了返回值不能污染后续股票的板块榜。"""
+        calls: list = []
+        adapter = self._counting_adapter(calls)
+
+        first = adapter.get_capital_flow("600519")
+        first["sector_rankings"]["top"][0]["name"] = "被污染"
+
+        second = adapter.get_capital_flow("002463")
+        self.assertEqual(second["sector_rankings"]["top"][0]["name"], "半导体设备")
+
+    def test_sector_failure_is_not_cached(self) -> None:
+        """板块两源都挂时不能把空结果缓存住，否则同一轮后续股票全部没有板块榜。"""
+        calls: list = []
+        adapter = TushareFundamentalAdapter()
+        adapter._api = object()
+        state = {"dc": None}
+        table = {"moneyflow": self._moneyflow_df()}
+
+        def _fake(api_name, **_kwargs):
+            calls.append(api_name)
+            if api_name == "moneyflow_ind_dc":
+                return state["dc"]
+            return table.get(api_name)
+
+        patcher = patch.object(adapter, "_call_api", side_effect=_fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        first = adapter.get_capital_flow("600519")
+        self.assertEqual(first["sector_rankings"]["top"], [])
+
+        state["dc"] = self._dc_df()
+        second = adapter.get_capital_flow("002463")
+        self.assertEqual(second["sector_rankings"]["top"][0]["name"], "半导体设备")
 
 
 if __name__ == "__main__":

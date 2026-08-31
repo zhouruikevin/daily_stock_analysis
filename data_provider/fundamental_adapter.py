@@ -11,9 +11,12 @@ caller; partial data is allowed.
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
+import time
 from datetime import datetime, timedelta
+from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -310,6 +313,17 @@ class TushareFundamentalAdapter:
     Preferred over AkShare for these data points because Tushare provides
     structured, reliable financial data via its Pro API.
     """
+
+    # 板块资金流只取决于交易日，与个股无关：一轮 17 只股票原本要重复拉 17 次
+    # 同一份榜单，白白抬高单只超预算（进而触发买入降级护栏）的概率。
+    _SECTOR_FLOW_CACHE_TTL_SECONDS = 300.0
+    _sector_flow_cache_lock = RLock()
+    _sector_flow_cache: Dict[Tuple[str, int], Tuple[float, Dict[str, Any], str]] = {}
+
+    @classmethod
+    def clear_sector_flow_cache_for_tests(cls) -> None:
+        with cls._sector_flow_cache_lock:
+            cls._sector_flow_cache.clear()
 
     def __init__(self) -> None:
         self._api = None
@@ -772,6 +786,16 @@ class TushareFundamentalAdapter:
         top_n: int,
     ) -> None:
         """填充板块资金流：DC（东财）优先，THS（同花顺）兜底。"""
+        cache_key = (trade_date, top_n)
+        now = time.monotonic()
+        with self.__class__._sector_flow_cache_lock:
+            cached = self.__class__._sector_flow_cache.get(cache_key)
+            if cached and cached[0] > now:
+                # 发深拷贝：上层会把整块 payload 往下传并可能改写，共享引用会污染后续股票
+                result["sector_rankings"] = copy.deepcopy(cached[1])
+                result["source_chain"].append(cached[2])
+                return
+
         # DC 与 AkShare 原路径同为东财口径，行业分类和单位（元）都直接对齐现有契约，
         # 故优先；THS 作兜底，其 net_amount 是亿元，与 DC 差 1e8，必须换算。
         candidates: Tuple[Tuple[str, str, str, float, Optional[str]], ...] = (
@@ -795,6 +819,13 @@ class TushareFundamentalAdapter:
             if self._apply_sector_frame(
                 result, df, name_col, flow_col, multiplier, top_n, f"tushare_{api_name}"
             ):
+                # 只缓存成功结果：失败若也缓存，同一轮后续股票会全部没有板块榜
+                with self.__class__._sector_flow_cache_lock:
+                    self.__class__._sector_flow_cache[cache_key] = (
+                        time.monotonic() + self.__class__._SECTOR_FLOW_CACHE_TTL_SECONDS,
+                        copy.deepcopy(result["sector_rankings"]),
+                        result["source_chain"][-1],
+                    )
                 return
             result["errors"].append(f"{api_name}_empty")
 
