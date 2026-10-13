@@ -57,7 +57,7 @@ cat /tmp/qoder_stock_run.log | grep -E "\|\[进度\|\■\|\📧\|失败\|异常\
 2. **不要手动启代理**：脚本会自动检测并拉起 `qoder_llm_proxy.py`。
 3. **必须后台跑 + 读日志汇报进度**：让用户随时看到"跑到第几只"，不要闷头等。
 4. **默认发合并邮件**，不额外询问；用户明确说不发才加 `NO_EMAIL=1`。
-5. **模型默认 `DeepSeek-V4-Flash`**，由脚本的 `LITELLM_MODEL=openai/deepseek-v4-flash` 控制；需要换模型时加 `QODER_PROXY_MODEL=...` 环境变量。
+5. **模型默认 `DeepSeek-Flash`**（qodercli 会随版本调整可用模型列表，如旧版 `DeepSeek-V4-Flash` 已下线），由脚本的 `LITELLM_MODEL=openai/deepseek-flash` 控制；需要换模型时加 `QODER_PROXY_MODEL=...` 环境变量。
 
 ## 常用命令速查
 

@@ -49,12 +49,15 @@ PROXY_HOST: str = os.getenv("QODER_PROXY_HOST", "127.0.0.1")
 PROXY_PORT: int = int(os.getenv("QODER_PROXY_PORT", "8765"))
 QODERCLI_PATH: str = os.getenv("QODERCLI_PATH", "qodercli")
 REQUEST_TIMEOUT: int = int(os.getenv("QODER_PROXY_TIMEOUT", "200"))
-DEFAULT_MODEL: str = os.getenv("QODER_PROXY_MODEL", "DeepSeek-V4-Pro")
+DEFAULT_MODEL: str = os.getenv("QODER_PROXY_MODEL", "DeepSeek-Flash")
 
 # litellm name → qodercli name
+# 注：qodercli 模型列表会随版本变化（如 DeepSeek-V4-Flash 已下线），
+# 旧别名统一映射到当前可用模型，避免 "Invalid model" 导致 exit 42。
 MODEL_MAP: Dict[str, str] = {
     "deepseek-v4-pro": "DeepSeek-V4-Pro",
-    "deepseek-v4-flash": "DeepSeek-V4-Flash",
+    "deepseek-flash": "DeepSeek-Flash",
+    "deepseek-v4-flash": "DeepSeek-Flash",
     "efficient": "Efficient",
     "auto": "Auto",
     "performance": "Performance",

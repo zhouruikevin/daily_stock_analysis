@@ -1,12 +1,13 @@
 #!/bin/bash
 # 用 Qoder（qodercli）经原分析管道分析股票，逐只反馈进度，最后发合并邮件。
-# 模型：QODER_PROXY_MODEL（默认 DeepSeek-V4-Flash），可用 QODER_PROXY_MODEL=xxx 覆盖。
+# 模型：QODER_PROXY_MODEL（默认 DeepSeek-Flash），可用 QODER_PROXY_MODEL=xxx 覆盖。
 #
 # 用法（在项目根目录执行）：
 #   bash scripts/analyze_with_qoder.sh                    # 分析 .env 的 STOCK_LIST（关注列表）
 #   bash scripts/analyze_with_qoder.sh 600519,603444      # 分析指定股票
 #   MAX_WORKERS=5 bash scripts/analyze_with_qoder.sh      # 调并发线程数（默认 4）
 #   NO_EMAIL=1 bash scripts/analyze_with_qoder.sh 603444  # 只分析存库不发邮件（联调）
+#   PROXY_PORT=8766 bash scripts/analyze_with_qoder.sh    # 8765 被其他进程占用时用备用端口
 #
 # 进度：每只分析完成即打印一行  [进度 k/N] <code> <name> ✅ 评分.. <操作>
 # 原理：启动 qoder_llm_proxy（若未运行）→ 把 LLM 渠道临时指向该代理 →
@@ -16,20 +17,24 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 PY=.venv/bin/python3
-PROXY_URL="http://127.0.0.1:8765"
-export QODER_PROXY_MODEL="${QODER_PROXY_MODEL:-DeepSeek-V4-Flash}"
+PROXY_PORT="${PROXY_PORT:-8765}"
+PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
+export QODER_PROXY_MODEL="${QODER_PROXY_MODEL:-DeepSeek-Flash}"
 
 # 1) 确保代理在运行（未启动则自动拉起）
-if ! curl -s "${PROXY_URL}/health" >/dev/null 2>&1; then
-  echo "[qoder] 代理未运行，正在启动 (model=${QODER_PROXY_MODEL}) ..."
-  nohup "$PY" scripts/qoder_llm_proxy.py > /tmp/qoder_proxy.log 2>&1 &
+# 健康检查必须校验响应体含 status 字段：端口若被无关服务占用，
+# curl 仅凭退出码会误判“就绪”，导致 LLM 调用全部打到错误服务。
+proxy_ok() { curl -s -m 3 "${PROXY_URL}/health" 2>/dev/null | grep -q '"status"'; }
+if ! proxy_ok; then
+  echo "[qoder] 代理未运行，正在启动 (port=${PROXY_PORT}, model=${QODER_PROXY_MODEL}) ..."
+  QODER_PROXY_PORT="${PROXY_PORT}" nohup "$PY" scripts/qoder_llm_proxy.py > /tmp/qoder_proxy.log 2>&1 &
   for _ in $(seq 1 15); do
     sleep 1
-    curl -s "${PROXY_URL}/health" >/dev/null 2>&1 && break
+    proxy_ok && break
   done
 fi
 HEALTH="$(curl -s "${PROXY_URL}/health" 2>/dev/null || true)"
-[ -n "$HEALTH" ] || { echo "[qoder] 代理启动失败，见 /tmp/qoder_proxy.log"; exit 1; }
+echo "${HEALTH}" | grep -q '"status"' || { echo "[qoder] 代理启动失败（${HEALTH:-无响应}），见 /tmp/qoder_proxy.log"; exit 1; }
 echo "[qoder] 代理就绪: ${HEALTH}"
 
 # 2) 把 LLM 渠道临时指向 qoder 代理（仅本次进程）
@@ -37,9 +42,9 @@ export LLM_CHANNELS=qoder
 export LLM_QODER_PROTOCOL=openai
 export LLM_QODER_BASE_URL="${PROXY_URL}/v1"
 export LLM_QODER_API_KEY=dummy
-export LLM_QODER_MODELS=deepseek-v4-flash
+export LLM_QODER_MODELS=deepseek-flash
 export LLM_QODER_ENABLED=true
-export LITELLM_MODEL=openai/deepseek-v4-flash
+export LITELLM_MODEL=openai/deepseek-flash
 export MAX_WORKERS="${MAX_WORKERS:-4}"
 # LLM 调用约 30-120s，叠加数据源抖动可能顶爆管道
 # 200s 单股预算可能不足，这里放宽到 360s，仅影响本脚本这条链路。
